@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import threading
 import unicodedata
@@ -51,6 +52,8 @@ WARNINGS_FILE = BASE_DIR / "warnings.json"
 ROBLOX_LINKS_FILE = BASE_DIR / "roblox_links.json"
 TEMP_BANS_FILE = BASE_DIR / "temporary_bans.json"
 CASES_FILE = BASE_DIR / "moderation_cases.json"
+DEPARTED_MEMBERS_FILE = BASE_DIR / "departed_members.json"
+QUESTIONS_FILE = BASE_DIR / "questions.json"
 
 IMAGE_CRY = BASE_DIR / "CRY.png"
 IMAGE_READ = BASE_DIR / "READ.png"
@@ -518,7 +521,11 @@ class ReneBot(commands.Bot):
         self.roblox_links = load_json(ROBLOX_LINKS_FILE, {})
         self.temporary_bans = load_json(TEMP_BANS_FILE, {})
         self.moderation_cases = load_json(CASES_FILE, {})
+        self.departed_members = load_json(DEPARTED_MEMBERS_FILE, {})
+        self.questions = load_json(QUESTIONS_FILE, {})
         self.idle_avatar_applied = False
+        self.last_task_until: datetime | None = None
+        self.presence_lock = asyncio.Lock()
         self.stopping = False
 
     async def setup_hook(self) -> None:
@@ -527,10 +534,18 @@ class ReneBot(commands.Bot):
 
         if not temporary_ban_checker.is_running():
             temporary_ban_checker.start()
+        if not funny_presence_loop.is_running():
+            funny_presence_loop.start()
+        if not seniority_refresh_loop.is_running():
+            seniority_refresh_loop.start()
 
     async def close(self) -> None:
         if temporary_ban_checker.is_running():
             temporary_ban_checker.cancel()
+        if funny_presence_loop.is_running():
+            funny_presence_loop.cancel()
+        if seniority_refresh_loop.is_running():
+            seniority_refresh_loop.cancel()
         await super().close()
 
     def get_guild_config(self, guild_id: int) -> dict[str, Any]:
@@ -541,6 +556,10 @@ class ReneBot(commands.Bot):
                 "welcome_channel_id": None,
                 "announcement_channel_id": None,
                 "staff_records_channel_id": None,
+                "seniority_channel_id": None,
+                "questions_channel_id": None,
+                "moderator_role_id": None,
+                "seniority_message_id": None,
                 "allowed_domains": sorted(DEFAULT_ALLOWED_DOMAINS),
             }
             save_json(CONFIG_FILE, self.config_data)
@@ -549,11 +568,371 @@ class ReneBot(commands.Bot):
         config.setdefault("welcome_channel_id", None)
         config.setdefault("announcement_channel_id", None)
         config.setdefault("staff_records_channel_id", None)
+        config.setdefault("seniority_channel_id", None)
+        config.setdefault("questions_channel_id", None)
+        config.setdefault("moderator_role_id", None)
+        config.setdefault("seniority_message_id", None)
         config.setdefault("allowed_domains", sorted(DEFAULT_ALLOWED_DOMAINS))
         return config
 
 
 bot = ReneBot()
+
+
+
+# ============================================================
+# ACTIVITÉ DE RENÉ
+# ============================================================
+
+FUNNY_ACTIVITIES = [
+    "chercher son café",
+    "classer un dossier vide",
+    "faire semblant de travailler",
+    "attendre la fin de son intérim",
+    "réparer l'imprimante",
+    "compter ses 0 € de salaire",
+    "chercher le bouton « tout réparer »",
+    "surveiller les cartons suspects",
+    "demander une pause au patron",
+    "trier les tickets par couleur",
+]
+
+
+async def set_task_presence(task_name: str) -> None:
+    async with bot.presence_lock:
+        bot.last_task_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        try:
+            await bot.change_presence(
+                status=discord.Status.online,
+                activity=discord.Game(name=f"/{task_name}"),
+            )
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.interaction_check
+async def global_command_check(interaction: discord.Interaction) -> bool:
+    command_name = interaction.command.name if interaction.command else "commande"
+    await set_task_presence(command_name)
+    return True
+
+
+@tasks.loop(minutes=3)
+async def funny_presence_loop() -> None:
+    if bot.stopping or bot.user is None:
+        return
+
+    now = datetime.now(timezone.utc)
+    if bot.last_task_until and now < bot.last_task_until:
+        return
+
+    try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Game(name=random.choice(FUNNY_ACTIVITIES)),
+        )
+    except discord.HTTPException:
+        pass
+
+
+@funny_presence_loop.before_loop
+async def before_funny_presence_loop() -> None:
+    await bot.wait_until_ready()
+
+
+# ============================================================
+# CLASSEMENT D'ANCIENNETÉ
+# ============================================================
+
+def format_duration_since(date: datetime | None) -> str:
+    if date is None:
+        return "date inconnue"
+
+    now = datetime.now(timezone.utc)
+    delta = max(now - date, timedelta())
+    days = delta.days
+
+    years, remainder = divmod(days, 365)
+    months, days_left = divmod(remainder, 30)
+
+    parts: list[str] = []
+    if years:
+        parts.append(f"{years} an{'s' if years > 1 else ''}")
+    if months:
+        parts.append(f"{months} mois")
+    if not years and days_left:
+        parts.append(f"{days_left} jour{'s' if days_left > 1 else ''}")
+
+    return ", ".join(parts) or "aujourd'hui"
+
+
+def oldest_current_members(guild: discord.Guild) -> list[discord.Member]:
+    members = [
+        member for member in guild.members
+        if not member.bot and member.joined_at is not None
+    ]
+    return sorted(members, key=lambda member: member.joined_at)[:10]
+
+
+def oldest_departed_members(guild: discord.Guild) -> list[dict[str, Any]]:
+    records = bot.departed_members.get(str(guild.id), [])
+    current_ids = {member.id for member in guild.members}
+
+    usable = [
+        record for record in records
+        if int(record.get("user_id", 0)) not in current_ids
+        and record.get("joined_at")
+    ]
+
+    def joined_key(record: dict[str, Any]) -> datetime:
+        try:
+            return datetime.fromisoformat(str(record["joined_at"]))
+        except (ValueError, TypeError):
+            return datetime.max.replace(tzinfo=timezone.utc)
+
+    return sorted(usable, key=joined_key)[:10]
+
+
+async def update_seniority_board(guild: discord.Guild) -> None:
+    config = bot.get_guild_config(guild.id)
+    channel_id = config.get("seniority_channel_id")
+
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(int(channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    current_lines: list[str] = []
+    medals = ["🥇", "🥈", "🥉"]
+
+    for index, member in enumerate(oldest_current_members(guild), start=1):
+        prefix = medals[index - 1] if index <= 3 else f"`#{index}`"
+        joined = member.joined_at
+        timestamp = int(joined.timestamp()) if joined else 0
+        current_lines.append(
+            f"{prefix} **{member.display_name}** — "
+            f"depuis <t:{timestamp}:D> "
+            f"(**{format_duration_since(joined)}**)"
+        )
+
+    departed_lines: list[str] = []
+    for index, record in enumerate(oldest_departed_members(guild), start=1):
+        prefix = medals[index - 1] if index <= 3 else f"`#{index}`"
+        try:
+            joined = datetime.fromisoformat(str(record["joined_at"]))
+            joined_ts = int(joined.timestamp())
+            duration = format_duration_since(joined)
+        except (ValueError, TypeError):
+            joined_ts = 0
+            duration = "date inconnue"
+
+        left_text = ""
+        try:
+            left = datetime.fromisoformat(str(record.get("left_at", "")))
+            left_text = f" • parti <t:{int(left.timestamp())}:R>"
+        except (ValueError, TypeError):
+            pass
+
+        departed_lines.append(
+            f"{prefix} **{record.get('display_name', 'Ancien membre')}** — "
+            f"avait rejoint <t:{joined_ts}:D> "
+            f"(**{duration} depuis son arrivée**){left_text}"
+        )
+
+    embed = build_embed(
+        "🏆 Classement d'ancienneté",
+        (
+            "### Membres toujours présents\n"
+            + ("\n".join(current_lines) if current_lines else "*Aucun membre classé.*")
+            + "\n\n### Anciens membres ayant quitté le serveur\n"
+            + ("\n".join(departed_lines) if departed_lines else
+               "*Aucun départ enregistré pour le moment.*")
+            + "\n\n-# Le classement des anciens membres commence à partir de "
+              "l'installation de cette version de René."
+        ),
+        COLOR_PRIMARY,
+    )
+
+    message_id = config.get("seniority_message_id")
+    message: discord.Message | None = None
+
+    if message_id:
+        try:
+            message = await channel.fetch_message(int(message_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            message = None
+
+    if message is None:
+        message = await channel.send(embed=embed)
+        config["seniority_message_id"] = message.id
+        save_json(CONFIG_FILE, bot.config_data)
+    else:
+        await message.edit(embed=embed)
+
+
+@tasks.loop(hours=6)
+async def seniority_refresh_loop() -> None:
+    for guild in bot.guilds:
+        try:
+            await update_seniority_board(guild)
+        except Exception:
+            logger.exception("Impossible d'actualiser le classement d'ancienneté.")
+
+
+@seniority_refresh_loop.before_loop
+async def before_seniority_refresh_loop() -> None:
+    await bot.wait_until_ready()
+
+
+# ============================================================
+# QUESTIONS AUX MODÉRATEURS
+# ============================================================
+
+def member_has_moderator_role(member: discord.Member) -> bool:
+    config = bot.get_guild_config(member.guild.id)
+    role_id = config.get("moderator_role_id")
+    return bool(
+        role_id
+        and any(role.id == int(role_id) for role in member.roles)
+    ) or member.guild_permissions.manage_messages
+
+
+async def register_question(message: discord.Message) -> None:
+    if message.guild is None:
+        return
+
+    guild_questions = bot.questions.setdefault(str(message.guild.id), {})
+    guild_questions[str(message.id)] = {
+        "author_id": message.author.id,
+        "channel_id": message.channel.id,
+        "content": message.content[:1800],
+        "answered": False,
+        "answered_by": None,
+        "answer": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(QUESTIONS_FILE, bot.questions)
+
+    config = bot.get_guild_config(message.guild.id)
+    role_id = config.get("moderator_role_id")
+    staff_channel_id = config.get("staff_records_channel_id")
+    notify_channel = (
+        message.guild.get_channel(int(staff_channel_id))
+        if staff_channel_id else message.channel
+    )
+
+    if not isinstance(notify_channel, discord.TextChannel):
+        notify_channel = message.channel
+
+    role_mention = f"<@&{role_id}>" if role_id else "**Modérateurs**"
+
+    await notify_channel.send(
+        content=f"📨 {role_mention}, une nouvelle question attend une réponse.",
+        embed=build_embed(
+            "Question reçue",
+            (
+                f"👤 **Auteur :** {message.author.mention}\n"
+                f"📍 **Question originale :** [ouvrir le message]({message.jump_url})\n\n"
+                f"**Question :**\n{message.content}\n\n"
+                "Répondez directement au message original avec la fonction "
+                "**Répondre** de Discord."
+            ),
+            COLOR_INFO,
+        ),
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False),
+    )
+
+    await message.reply(
+        embed=build_embed(
+            "Question transmise",
+            "René a remis ta question aux modérateurs. Tu recevras la réponse en MP.",
+            COLOR_SUCCESS,
+        ),
+        mention_author=False,
+    )
+
+
+async def process_moderator_answer(message: discord.Message) -> bool:
+    if (
+        message.guild is None
+        or not isinstance(message.author, discord.Member)
+        or not message.reference
+        or not message.reference.message_id
+        or not member_has_moderator_role(message.author)
+    ):
+        return False
+
+    guild_questions = bot.questions.get(str(message.guild.id), {})
+    question = guild_questions.get(str(message.reference.message_id))
+
+    if not question:
+        return False
+
+    if question.get("answered"):
+        answered_by_id = question.get("answered_by")
+        answered_by = (
+            message.guild.get_member(int(answered_by_id))
+            if answered_by_id else None
+        )
+        answered_name = answered_by.display_name if answered_by else "un autre modérateur"
+
+        await message.reply(
+            f"Désolé {message.author.mention}, **{answered_name}** a déjà répondu "
+            "à cette question.",
+            mention_author=False,
+        )
+        return True
+
+    if not message.content.strip():
+        await message.reply(
+            "La réponse ne peut pas être vide.",
+            mention_author=False,
+        )
+        return True
+
+    question["answered"] = True
+    question["answered_by"] = message.author.id
+    question["answer"] = message.content[:1800]
+    question["answered_at"] = datetime.now(timezone.utc).isoformat()
+    save_json(QUESTIONS_FILE, bot.questions)
+
+    user = bot.get_user(int(question["author_id"]))
+    if user is None:
+        try:
+            user = await bot.fetch_user(int(question["author_id"]))
+        except discord.HTTPException:
+            user = None
+
+    if user is not None:
+        try:
+            await send_embed_with_thumbnail(
+                user,
+                title="Réponse à ta question",
+                description=(
+                    f"**Ta question :**\n{question.get('content', '')}\n\n"
+                    f"**Réponse de {message.author.display_name} :**\n"
+                    f"{message.content}"
+                ),
+                color=COLOR_SUCCESS,
+                image_path=IMAGE_READ,
+            )
+            delivery = "La réponse a été envoyée en MP."
+        except (discord.Forbidden, discord.HTTPException):
+            delivery = "Impossible d'envoyer le MP : les messages privés sont fermés."
+    else:
+        delivery = "Le membre n'a pas pu être retrouvé."
+
+    await message.reply(
+        embed=build_embed(
+            "Réponse enregistrée",
+            f"✅ {delivery}",
+            COLOR_SUCCESS,
+        ),
+        mention_author=False,
+    )
+    return True
 
 
 # ============================================================
@@ -581,7 +960,7 @@ async def on_ready() -> None:
 
     await bot.change_presence(
         status=discord.Status.online,
-        activity=discord.Game(name="classer les dossiers"),
+        activity=discord.Game(name=random.choice(FUNNY_ACTIVITIES)),
     )
 
     if not bot.idle_avatar_applied:
@@ -612,6 +991,34 @@ async def on_member_join(member: discord.Member) -> None:
             image_path=IMAGE_NEW,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
+
+    await update_seniority_board(member.guild)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member) -> None:
+    if member.bot:
+        return
+
+    guild_key = str(member.guild.id)
+    records = bot.departed_members.setdefault(guild_key, [])
+
+    records.append(
+        {
+            "user_id": member.id,
+            "display_name": member.display_name,
+            "joined_at": (
+                member.joined_at.isoformat()
+                if member.joined_at else None
+            ),
+            "left_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    # Garde au maximum les 500 derniers départs enregistrés.
+    bot.departed_members[guild_key] = records[-500:]
+    save_json(DEPARTED_MEMBERS_FILE, bot.departed_members)
+    await update_seniority_board(member.guild)
 
 
 # ============================================================
@@ -1097,6 +1504,21 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot or message.guild is None or bot.stopping:
         return
 
+    if await process_moderator_answer(message):
+        return
+
+    config = bot.get_guild_config(message.guild.id)
+    questions_channel_id = config.get("questions_channel_id")
+
+    if (
+        questions_channel_id
+        and message.channel.id == int(questions_channel_id)
+        and isinstance(message.author, discord.Member)
+        and not member_has_moderator_role(message.author)
+    ):
+        await register_question(message)
+        return
+
     await distribute_announcement(message)
 
     # Les liens sont inspectés avant le filtre de grossièretés.
@@ -1143,6 +1565,9 @@ async def on_message(message: discord.Message) -> None:
     salon_bienvenue="Salon des messages de bienvenue",
     salon_annonces="Salon où les @everyone sont envoyés en MP",
     salon_dossiers="Salon privé contenant les dossiers de modération",
+    salon_anciennete="Salon du classement d'ancienneté",
+    salon_questions="Salon où les membres posent leurs questions",
+    role_moderateur="Rôle autorisé à répondre aux questions",
 )
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
@@ -1151,28 +1576,35 @@ async def config_command(
     salon_bienvenue: discord.TextChannel | None = None,
     salon_annonces: discord.TextChannel | None = None,
     salon_dossiers: discord.TextChannel | None = None,
+    salon_anciennete: discord.TextChannel | None = None,
+    salon_questions: discord.TextChannel | None = None,
+    role_moderateur: discord.Role | None = None,
 ) -> None:
     assert interaction.guild is not None
 
     await begin_interaction_thinking(interaction)
-
     config = bot.get_guild_config(interaction.guild.id)
 
     if salon_bienvenue is not None:
         config["welcome_channel_id"] = salon_bienvenue.id
-
     if salon_annonces is not None:
         config["announcement_channel_id"] = salon_annonces.id
-
     if salon_dossiers is not None:
         config["staff_records_channel_id"] = salon_dossiers.id
+    if salon_anciennete is not None:
+        config["seniority_channel_id"] = salon_anciennete.id
+        config["seniority_message_id"] = None
+    if salon_questions is not None:
+        config["questions_channel_id"] = salon_questions.id
+    if role_moderateur is not None:
+        config["moderator_role_id"] = role_moderateur.id
 
     save_json(CONFIG_FILE, bot.config_data)
-    await asyncio.sleep(0.7)
 
-    welcome_id = config.get("welcome_channel_id")
-    announcements_id = config.get("announcement_channel_id")
-    records_id = config.get("staff_records_channel_id")
+    if salon_anciennete is not None:
+        await update_seniority_board(interaction.guild)
+
+    await asyncio.sleep(0.6)
 
     await finish_interaction(
         interaction,
@@ -1180,13 +1612,89 @@ async def config_command(
         description=(
             "La configuration de René est enregistrée.\n\n"
             f"👋 **Bienvenue :** "
-            f"{f'<#{welcome_id}>' if welcome_id else 'non configuré'}\n"
+            f"{f'<#{config.get('welcome_channel_id')}>' if config.get('welcome_channel_id') else 'non configuré'}\n"
             f"📢 **Annonces :** "
-            f"{f'<#{announcements_id}>' if announcements_id else 'non configuré'}\n"
-            f"📂 **Dossiers du staff :** "
-            f"{f'<#{records_id}>' if records_id else 'non configuré'}\n\n"
-            "Les liens sont toujours autorisés dans le salon d'annonces."
+            f"{f'<#{config.get('announcement_channel_id')}>' if config.get('announcement_channel_id') else 'non configuré'}\n"
+            f"📂 **Dossiers :** "
+            f"{f'<#{config.get('staff_records_channel_id')}>' if config.get('staff_records_channel_id') else 'non configuré'}\n"
+            f"🏆 **Ancienneté :** "
+            f"{f'<#{config.get('seniority_channel_id')}>' if config.get('seniority_channel_id') else 'non configuré'}\n"
+            f"❓ **Questions :** "
+            f"{f'<#{config.get('questions_channel_id')}>' if config.get('questions_channel_id') else 'non configuré'}\n"
+            f"🛡️ **Rôle modérateur :** "
+            f"{f'<@&{config.get('moderator_role_id')}>' if config.get('moderator_role_id') else 'non configuré'}"
         ),
+    )
+
+
+@bot.tree.command(
+    name="moddefinir",
+    description="Définir le rôle des modérateurs de René.",
+)
+@app_commands.describe(role="Rôle autorisé à répondre aux questions")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def mod_define_command(
+    interaction: discord.Interaction,
+    role: discord.Role,
+) -> None:
+    assert interaction.guild is not None
+
+    await begin_interaction_thinking(interaction)
+    config = bot.get_guild_config(interaction.guild.id)
+    config["moderator_role_id"] = role.id
+    save_json(CONFIG_FILE, bot.config_data)
+
+    await finish_interaction(
+        interaction,
+        title="C'est noté !",
+        description=f"Le rôle {role.mention} est maintenant reconnu comme modérateur.",
+    )
+
+
+@bot.tree.command(
+    name="salonquestions",
+    description="Définir le salon dans lequel les membres posent leurs questions.",
+)
+@app_commands.describe(salon="Salon réservé aux questions")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def questions_channel_command(
+    interaction: discord.Interaction,
+    salon: discord.TextChannel,
+) -> None:
+    assert interaction.guild is not None
+
+    await begin_interaction_thinking(interaction)
+    config = bot.get_guild_config(interaction.guild.id)
+    config["questions_channel_id"] = salon.id
+    save_json(CONFIG_FILE, bot.config_data)
+
+    await finish_interaction(
+        interaction,
+        title="C'est noté !",
+        description=(
+            f"Les questions des membres seront maintenant prises en charge dans "
+            f"{salon.mention}."
+        ),
+    )
+
+
+@bot.tree.command(
+    name="anciennete",
+    description="Actualiser manuellement le classement d'ancienneté.",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def seniority_command(interaction: discord.Interaction) -> None:
+    assert interaction.guild is not None
+
+    await begin_interaction_thinking(interaction)
+    await update_seniority_board(interaction.guild)
+    await finish_interaction(
+        interaction,
+        title="C'est noté !",
+        description="Le classement d'ancienneté a été actualisé.",
     )
 
 
@@ -1439,37 +1947,17 @@ async def slash_command_error(
 # ============================================================
 
 if __name__ == "__main__":
-    import traceback
-
-    print("[DÉMARRAGE] Lancement de René...", flush=True)
-    print(
-        f"[TOKEN] Variable présente : {bool(DISCORD_TOKEN)}",
-        flush=True,
-    )
-
     if not DISCORD_TOKEN:
         raise RuntimeError(
-            "La variable DISCORD_TOKEN est absente dans Render."
+            "La variable d'environnement DISCORD_TOKEN est absente. "
+            "Ajoute-la dans Render > Environment."
         )
 
-    try:
-        print("[WEB] Démarrage du serveur Flask...", flush=True)
+    web_thread = threading.Thread(
+        target=run_web_server,
+        name="rene-web-server",
+        daemon=True,
+    )
+    web_thread.start()
 
-        web_thread = threading.Thread(
-            target=run_web_server,
-            name="rene-web-server",
-            daemon=True,
-        )
-        web_thread.start()
-
-        print("[DISCORD] Connexion de René à Discord...", flush=True)
-
-        bot.run(
-            DISCORD_TOKEN.strip(),
-            log_handler=None,
-        )
-
-    except Exception:
-        print("[ERREUR FATALE] René n'a pas pu démarrer :", flush=True)
-        traceback.print_exc()
-        raise
+    bot.run(DISCORD_TOKEN, log_handler=None)
