@@ -72,6 +72,7 @@ MAX_WARNINGS = 10
 DISCORD_BAN_DURATION = timedelta(days=1)
 FAKE_ROBLOX_BAN_DAYS = 10
 DM_DELAY_SECONDS = 0.8
+STATUS_CHANNEL_ID = 1373577090213085204
 
 WELCOME_MESSAGE = (
     "Bienvenue {mention}, amuse-toi bien dans **VoidLoop's Studio** !"
@@ -804,7 +805,9 @@ async def register_question(message: discord.Message) -> None:
         return
 
     guild_questions = bot.questions.setdefault(str(message.guild.id), {})
-    guild_questions[str(message.id)] = {
+
+    question_data: dict[str, Any] = {
+        "question_message_id": message.id,
         "author_id": message.author.id,
         "channel_id": message.channel.id,
         "content": message.content[:1800],
@@ -812,15 +815,21 @@ async def register_question(message: discord.Message) -> None:
         "answered_by": None,
         "answer": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "staff_notification_message_id": None,
+        "confirmation_message_id": None,
     }
+
+    guild_questions[str(message.id)] = question_data
     save_json(QUESTIONS_FILE, bot.questions)
 
     config = bot.get_guild_config(message.guild.id)
     role_id = config.get("moderator_role_id")
     staff_channel_id = config.get("staff_records_channel_id")
+
     notify_channel = (
         message.guild.get_channel(int(staff_channel_id))
-        if staff_channel_id else message.channel
+        if staff_channel_id
+        else message.channel
     )
 
     if not isinstance(notify_channel, discord.TextChannel):
@@ -828,7 +837,7 @@ async def register_question(message: discord.Message) -> None:
 
     role_mention = f"<@&{role_id}>" if role_id else "**Modérateurs**"
 
-    await notify_channel.send(
+    notification_message = await notify_channel.send(
         content=f"📨 {role_mention}, une nouvelle question attend une réponse.",
         embed=build_embed(
             "Question reçue",
@@ -836,22 +845,60 @@ async def register_question(message: discord.Message) -> None:
                 f"👤 **Auteur :** {message.author.mention}\n"
                 f"📍 **Question originale :** [ouvrir le message]({message.jump_url})\n\n"
                 f"**Question :**\n{message.content}\n\n"
-                "Répondez directement au message original avec la fonction "
-                "**Répondre** de Discord."
+                "Pour répondre, utilisez la fonction **Répondre** sur :\n"
+                "• le message original du membre ;\n"
+                "• ou ce message de notification.\n\n"
+                "René enverra automatiquement la réponse en MP."
             ),
             COLOR_INFO,
         ),
-        allowed_mentions=discord.AllowedMentions(roles=True, users=False),
+        allowed_mentions=discord.AllowedMentions(
+            roles=True,
+            users=False,
+            everyone=False,
+        ),
     )
 
-    await message.reply(
+    confirmation_message = await message.reply(
         embed=build_embed(
             "Question transmise",
-            "René a remis ta question aux modérateurs. Tu recevras la réponse en MP.",
+            (
+                "René a remis ta question aux modérateurs.\n"
+                "Tu recevras leur réponse directement en message privé."
+            ),
             COLOR_SUCCESS,
         ),
         mention_author=False,
     )
+
+    question_data["staff_notification_message_id"] = notification_message.id
+    question_data["confirmation_message_id"] = confirmation_message.id
+    save_json(QUESTIONS_FILE, bot.questions)
+
+
+def find_question_from_reference(
+    guild_id: int,
+    referenced_message_id: int,
+) -> tuple[str | None, dict[str, Any] | None]:
+    guild_questions = bot.questions.get(str(guild_id), {})
+
+    # Réponse directe au message original.
+    direct = guild_questions.get(str(referenced_message_id))
+    if direct:
+        return str(referenced_message_id), direct
+
+    # Réponse au message de notification du staff ou au message de confirmation.
+    for question_id, question in guild_questions.items():
+        related_ids = {
+            int(question.get("question_message_id", 0) or 0),
+            int(question.get("staff_notification_message_id", 0) or 0),
+            int(question.get("confirmation_message_id", 0) or 0),
+        }
+
+        if referenced_message_id in related_ids:
+            return question_id, question
+
+    return None, None
 
 
 async def process_moderator_answer(message: discord.Message) -> bool:
@@ -864,65 +911,87 @@ async def process_moderator_answer(message: discord.Message) -> bool:
     ):
         return False
 
-    guild_questions = bot.questions.get(str(message.guild.id), {})
-    question = guild_questions.get(str(message.reference.message_id))
+    question_id, question = find_question_from_reference(
+        message.guild.id,
+        message.reference.message_id,
+    )
 
-    if not question:
+    if question is None or question_id is None:
         return False
 
     if question.get("answered"):
         answered_by_id = question.get("answered_by")
         answered_by = (
             message.guild.get_member(int(answered_by_id))
-            if answered_by_id else None
+            if answered_by_id
+            else None
         )
-        answered_name = answered_by.display_name if answered_by else "un autre modérateur"
+        answered_name = (
+            answered_by.display_name
+            if answered_by
+            else "un autre modérateur"
+        )
 
         await message.reply(
-            f"Désolé {message.author.mention}, **{answered_name}** a déjà répondu "
-            "à cette question.",
+            (
+                f"Désolé {message.author.mention}, "
+                f"**{answered_name}** a déjà répondu à cette question."
+            ),
             mention_author=False,
         )
         return True
 
-    if not message.content.strip():
+    answer_text = message.content.strip()
+
+    if not answer_text:
         await message.reply(
             "La réponse ne peut pas être vide.",
             mention_author=False,
         )
         return True
 
+    try:
+        user = bot.get_user(int(question["author_id"]))
+
+        if user is None:
+            user = await bot.fetch_user(int(question["author_id"]))
+
+        await send_embed_with_thumbnail(
+            user,
+            title="Réponse à ta question",
+            description=(
+                f"**Ta question :**\n{question.get('content', '')}\n\n"
+                f"**Réponse de {message.author.display_name} :**\n"
+                f"{answer_text}"
+            ),
+            color=COLOR_SUCCESS,
+            image_path=IMAGE_READ,
+        )
+
+        delivery = "La réponse a bien été envoyée en MP."
+
+    except discord.Forbidden:
+        delivery = (
+            "Je ne peux pas envoyer de MP à cette personne : "
+            "ses messages privés sont probablement fermés."
+        )
+
+    except discord.NotFound:
+        delivery = "Le compte de la personne n'a pas pu être retrouvé."
+
+    except discord.HTTPException as error:
+        logger.exception("Erreur pendant l'envoi de la réponse en MP.")
+        delivery = f"Erreur Discord pendant l'envoi du MP : `{error}`"
+
+    # La question est verrouillée dès qu'un modérateur a traité la réponse,
+    # afin d'empêcher deux réponses simultanées.
     question["answered"] = True
     question["answered_by"] = message.author.id
-    question["answer"] = message.content[:1800]
+    question["answer"] = answer_text[:1800]
     question["answered_at"] = datetime.now(timezone.utc).isoformat()
+    question["delivery_result"] = delivery
+    bot.questions[str(message.guild.id)][question_id] = question
     save_json(QUESTIONS_FILE, bot.questions)
-
-    user = bot.get_user(int(question["author_id"]))
-    if user is None:
-        try:
-            user = await bot.fetch_user(int(question["author_id"]))
-        except discord.HTTPException:
-            user = None
-
-    if user is not None:
-        try:
-            await send_embed_with_thumbnail(
-                user,
-                title="Réponse à ta question",
-                description=(
-                    f"**Ta question :**\n{question.get('content', '')}\n\n"
-                    f"**Réponse de {message.author.display_name} :**\n"
-                    f"{message.content}"
-                ),
-                color=COLOR_SUCCESS,
-                image_path=IMAGE_READ,
-            )
-            delivery = "La réponse a été envoyée en MP."
-        except (discord.Forbidden, discord.HTTPException):
-            delivery = "Impossible d'envoyer le MP : les messages privés sont fermés."
-    else:
-        delivery = "Le membre n'a pas pu être retrouvé."
 
     await message.reply(
         embed=build_embed(
@@ -932,6 +1001,7 @@ async def process_moderator_answer(message: discord.Message) -> bool:
         ),
         mention_author=False,
     )
+
     return True
 
 
@@ -966,6 +1036,32 @@ async def on_ready() -> None:
     if not bot.idle_avatar_applied:
         bot.idle_avatar_applied = True
         await set_bot_avatar(IMAGE_IDLE)
+
+    status_channel = bot.get_channel(STATUS_CHANNEL_ID)
+
+    if status_channel is None:
+        try:
+            status_channel = await bot.fetch_channel(STATUS_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            status_channel = None
+
+    if isinstance(status_channel, discord.TextChannel):
+        try:
+            await send_embed_with_thumbnail(
+                status_channel,
+                title="René est reconnecté !",
+                description=(
+                    "🟢 **René L'Intérimaire est de nouveau en service.**\n\n"
+                    "La connexion avec Discord est rétablie et René reprend "
+                    "ses dossiers là où il les avait laissés."
+                ),
+                color=COLOR_SUCCESS,
+                image_path=IMAGE_NEW,
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Impossible d'envoyer le message de reconnexion dans le salon status."
+            )
 
 
 # ============================================================
