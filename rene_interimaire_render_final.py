@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from flask import Flask, jsonify
+import imageio_ffmpeg
 
 import discord
 from discord import app_commands
@@ -34,9 +35,10 @@ from discord.ext import commands, tasks
 #   HAMMER.png
 #   SLEEP.png
 #   IDLE.png
+#   ATTENTE.mp3
 #
 # Installation :
-#   pip install -U discord.py Flask
+#   pip install -r requirements.txt
 #
 # Active dans le portail développeur Discord :
 #   - SERVER MEMBERS INTENT
@@ -47,6 +49,30 @@ from discord.ext import commands, tasks
 
 BASE_DIR = Path(__file__).resolve().parent
 
+
+def asset_path(*filenames: str) -> Path:
+    """Trouve un asset même si l'extension PNG est écrite en majuscules."""
+    for filename in filenames:
+        exact = BASE_DIR / filename
+        if exact.exists():
+            return exact
+
+    try:
+        files_by_name = {
+            path.name.casefold(): path
+            for path in BASE_DIR.iterdir()
+            if path.is_file()
+        }
+        for filename in filenames:
+            found = files_by_name.get(filename.casefold())
+            if found is not None:
+                return found
+    except OSError:
+        pass
+
+    return BASE_DIR / filenames[0]
+
+
 CONFIG_FILE = BASE_DIR / "config.json"
 WARNINGS_FILE = BASE_DIR / "warnings.json"
 ROBLOX_LINKS_FILE = BASE_DIR / "roblox_links.json"
@@ -55,16 +81,17 @@ CASES_FILE = BASE_DIR / "moderation_cases.json"
 DEPARTED_MEMBERS_FILE = BASE_DIR / "departed_members.json"
 QUESTIONS_FILE = BASE_DIR / "questions.json"
 
-IMAGE_CRY = BASE_DIR / "CRY.png"
-IMAGE_READ = BASE_DIR / "READ.png"
-IMAGE_NEW = BASE_DIR / "NEW.png"
-IMAGE_NOTED = BASE_DIR / "C'EST_NOTÉ.png"
-IMAGE_THINKING = BASE_DIR / "REFLECHIS.png"
-IMAGE_DELIVER = BASE_DIR / "DELIVER.png"
-IMAGE_INSPECT = BASE_DIR / "INSPECT.png"
-IMAGE_HAMMER = BASE_DIR / "HAMMER.png"
-IMAGE_SLEEP = BASE_DIR / "SLEEP.png"
-IMAGE_IDLE = BASE_DIR / "IDLE.png"
+IMAGE_CRY = asset_path("CRY.png")
+IMAGE_READ = asset_path("READ.png")
+IMAGE_NEW = asset_path("NEW.png")
+IMAGE_NOTED = asset_path("C'EST_NOTÉ.png", "C'EST_NOTÉ.PNG", "CEST_NOTE.png")
+IMAGE_THINKING = asset_path("REFLECHIS.png")
+IMAGE_DELIVER = asset_path("DELIVER.png")
+IMAGE_INSPECT = asset_path("INSPECT.png")
+IMAGE_HAMMER = asset_path("HAMMER.png")
+IMAGE_SLEEP = asset_path("SLEEP.png")
+IMAGE_IDLE = asset_path("IDLE.png")
+AUDIO_WAITING = asset_path("ATTENTE.mp3", "ATTENTE.MP3")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -73,6 +100,8 @@ DISCORD_BAN_DURATION = timedelta(days=1)
 FAKE_ROBLOX_BAN_DAYS = 10
 DM_DELAY_SECONDS = 0.8
 STATUS_CHANNEL_ID = 1373577090213085204
+VOICE_CONNECT_TIMEOUT_SECONDS = 25.0
+VOICE_RETRY_DELAY_SECONDS = 5.0
 
 WELCOME_MESSAGE = (
     "Bienvenue {mention}, amuse-toi bien dans **VoidLoop's Studio** !"
@@ -500,15 +529,28 @@ def run_web_server() -> None:
 # BOT
 # ============================================================
 
+class ReneCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        command_name = (
+            interaction.command.name
+            if interaction.command is not None
+            else "commande"
+        )
+        await set_task_presence(command_name)
+        return True
+
+
 class ReneBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.members = True
         intents.message_content = True
+        intents.voice_states = True
 
         super().__init__(
             command_prefix="!",
             intents=intents,
+            tree_cls=ReneCommandTree,
             allowed_mentions=discord.AllowedMentions(
                 users=True,
                 roles=False,
@@ -527,6 +569,7 @@ class ReneBot(commands.Bot):
         self.idle_avatar_applied = False
         self.last_task_until: datetime | None = None
         self.presence_lock = asyncio.Lock()
+        self.waiting_voice_tasks: dict[int, asyncio.Task[None]] = {}
         self.stopping = False
 
     async def setup_hook(self) -> None:
@@ -547,6 +590,22 @@ class ReneBot(commands.Bot):
             funny_presence_loop.cancel()
         if seniority_refresh_loop.is_running():
             seniority_refresh_loop.cancel()
+
+        for task in list(self.waiting_voice_tasks.values()):
+            task.cancel()
+        if self.waiting_voice_tasks:
+            await asyncio.gather(
+                *self.waiting_voice_tasks.values(),
+                return_exceptions=True,
+            )
+        self.waiting_voice_tasks.clear()
+
+        for voice_client in list(self.voice_clients):
+            try:
+                await voice_client.disconnect(force=True)
+            except discord.HTTPException:
+                pass
+
         await super().close()
 
     def get_guild_config(self, guild_id: int) -> dict[str, Any]:
@@ -560,6 +619,7 @@ class ReneBot(commands.Bot):
                 "seniority_channel_id": None,
                 "questions_channel_id": None,
                 "moderator_role_id": None,
+                "waiting_voice_channel_id": None,
                 "seniority_message_id": None,
                 "allowed_domains": sorted(DEFAULT_ALLOWED_DOMAINS),
             }
@@ -572,6 +632,7 @@ class ReneBot(commands.Bot):
         config.setdefault("seniority_channel_id", None)
         config.setdefault("questions_channel_id", None)
         config.setdefault("moderator_role_id", None)
+        config.setdefault("waiting_voice_channel_id", None)
         config.setdefault("seniority_message_id", None)
         config.setdefault("allowed_domains", sorted(DEFAULT_ALLOWED_DOMAINS))
         return config
@@ -609,13 +670,6 @@ async def set_task_presence(task_name: str) -> None:
             )
         except discord.HTTPException:
             pass
-
-
-@bot.tree.interaction_check
-async def global_command_check(interaction: discord.Interaction) -> bool:
-    command_name = interaction.command.name if interaction.command else "commande"
-    await set_task_presence(command_name)
-    return True
 
 
 @tasks.loop(minutes=3)
@@ -1006,6 +1060,264 @@ async def process_moderator_answer(message: discord.Message) -> bool:
 
 
 # ============================================================
+# VOCAL D'ATTENTE URGENTE
+# ============================================================
+
+def get_configured_moderators(guild: discord.Guild) -> list[discord.Member]:
+    config = bot.get_guild_config(guild.id)
+    role_id = config.get("moderator_role_id")
+
+    moderators: list[discord.Member] = []
+    seen: set[int] = set()
+
+    if role_id:
+        role = guild.get_role(int(role_id))
+        if role is not None:
+            for member in role.members:
+                if not member.bot and member.id not in seen:
+                    moderators.append(member)
+                    seen.add(member.id)
+
+    # Secours : si aucun rôle n'est configuré ou qu'il est vide,
+    # René prévient les membres qui peuvent gérer les messages.
+    if not moderators:
+        for member in guild.members:
+            if (
+                not member.bot
+                and member.id not in seen
+                and (
+                    member.guild_permissions.manage_messages
+                    or member.guild_permissions.administrator
+                )
+            ):
+                moderators.append(member)
+                seen.add(member.id)
+
+    return moderators
+
+
+def waiting_members(channel: discord.VoiceChannel) -> list[discord.Member]:
+    """Membres non-bots et non-modérateurs réellement en attente."""
+    return [
+        member
+        for member in channel.members
+        if not member.bot and not member_has_moderator_role(member)
+    ]
+
+
+def get_ffmpeg_executable() -> str:
+    custom = os.getenv("FFMPEG_EXECUTABLE")
+    if custom:
+        return custom
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+async def notify_moderators_waiting(
+    guild: discord.Guild,
+    channel: discord.VoiceChannel,
+    members: list[discord.Member],
+    cycle_number: int,
+) -> tuple[int, int]:
+    moderators = get_configured_moderators(guild)
+    sent = 0
+    failed = 0
+
+    waiting_list = "\n".join(
+        f"• **{member.display_name}** (`{member.id}`)"
+        for member in members
+    )
+
+    for moderator in moderators:
+        try:
+            await send_embed_with_thumbnail(
+                moderator,
+                title="🚨 URGENT — Une personne attend",
+                description=(
+                    f"Une ou plusieurs personnes attendent dans "
+                    f"**{channel.name}** sur **{guild.name}**.\n\n"
+                    f"{waiting_list}\n\n"
+                    f"🔁 **Rappel sonore n°{cycle_number}**\n"
+                    "Rejoins rapidement le vocal pour les prendre en charge."
+                ),
+                color=COLOR_DANGER,
+                image_path=IMAGE_DELIVER,
+            )
+            sent += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+    logger.info(
+        "Alerte vocal attente serveur=%s cycle=%s envoyés=%s échecs=%s",
+        guild.id,
+        cycle_number,
+        sent,
+        failed,
+    )
+    return sent, failed
+
+
+async def waiting_voice_loop(guild: discord.Guild) -> None:
+    cycle_number = 0
+
+    try:
+        while not bot.stopping:
+            config = bot.get_guild_config(guild.id)
+            channel_id = config.get("waiting_voice_channel_id")
+
+            if not channel_id:
+                break
+
+            channel = guild.get_channel(int(channel_id))
+            if not isinstance(channel, discord.VoiceChannel):
+                break
+
+            members = waiting_members(channel)
+            if not members:
+                break
+
+            if not AUDIO_WAITING.is_file():
+                logger.error(
+                    "Le fichier ATTENTE.mp3 est introuvable dans %s.",
+                    BASE_DIR,
+                )
+                # Une seule alerte utile au lieu d'une boucle ultra-rapide.
+                for moderator in get_configured_moderators(guild):
+                    try:
+                        await moderator.send(
+                            "❌ René ne trouve pas `ATTENTE.mp3`. "
+                            "Ajoute le fichier dans le même dossier que le script."
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                break
+
+            voice_client = guild.voice_client
+
+            try:
+                if voice_client is None or not voice_client.is_connected():
+                    voice_client = await channel.connect(
+                        timeout=VOICE_CONNECT_TIMEOUT_SECONDS,
+                        reconnect=True,
+                        self_deaf=True,
+                    )
+                elif voice_client.channel.id != channel.id:
+                    await voice_client.move_to(channel)
+            except (asyncio.TimeoutError, discord.ClientException, discord.HTTPException):
+                logger.exception(
+                    "Impossible de rejoindre le vocal d'attente du serveur %s.",
+                    guild.id,
+                )
+                await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
+                continue
+
+            # Si le son précédent est encore actif, on attend sa fin.
+            while voice_client.is_playing() or voice_client.is_paused():
+                await asyncio.sleep(0.25)
+
+            cycle_number += 1
+
+            # À CHAQUE redémarrage du son, René renvoie l'alerte en MP.
+            await notify_moderators_waiting(
+                guild,
+                channel,
+                members,
+                cycle_number,
+            )
+
+            playback_finished = asyncio.Event()
+            event_loop = asyncio.get_running_loop()
+
+            def after_playback(error: Exception | None) -> None:
+                if error is not None:
+                    logger.error(
+                        "Erreur de lecture d'ATTENTE.mp3 : %s",
+                        error,
+                    )
+                event_loop.call_soon_threadsafe(playback_finished.set)
+
+            try:
+                source = discord.FFmpegOpusAudio(
+                    str(AUDIO_WAITING),
+                    executable=get_ffmpeg_executable(),
+                    before_options="-nostdin -hide_banner -loglevel error",
+                    options="-vn",
+                )
+                voice_client.play(source, after=after_playback)
+                await playback_finished.wait()
+            except (discord.ClientException, OSError, RuntimeError):
+                logger.exception("Impossible de lire ATTENTE.mp3.")
+                await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
+
+    except asyncio.CancelledError:
+        raise
+    finally:
+        voice_client = guild.voice_client
+        if voice_client is not None:
+            try:
+                if voice_client.is_playing() or voice_client.is_paused():
+                    voice_client.stop()
+                await voice_client.disconnect(force=True)
+            except discord.HTTPException:
+                pass
+
+        bot.waiting_voice_tasks.pop(guild.id, None)
+
+
+async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
+    config = bot.get_guild_config(guild.id)
+    channel_id = config.get("waiting_voice_channel_id")
+
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(int(channel_id))
+    if not isinstance(channel, discord.VoiceChannel):
+        return
+
+    if not waiting_members(channel):
+        existing = bot.waiting_voice_tasks.get(guild.id)
+        if existing and not existing.done():
+            voice_client = guild.voice_client
+            if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+                voice_client.stop()
+        return
+
+    existing = bot.waiting_voice_tasks.get(guild.id)
+    if existing is not None and not existing.done():
+        return
+
+    task = asyncio.create_task(
+        waiting_voice_loop(guild),
+        name=f"waiting-voice-{guild.id}",
+    )
+    bot.waiting_voice_tasks[guild.id] = task
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    if member.bot or bot.stopping:
+        return
+
+    config = bot.get_guild_config(member.guild.id)
+    channel_id = config.get("waiting_voice_channel_id")
+    if not channel_id:
+        return
+
+    watched_id = int(channel_id)
+    changed_watched_channel = (
+        (before.channel is not None and before.channel.id == watched_id)
+        or (after.channel is not None and after.channel.id == watched_id)
+    )
+
+    if changed_watched_channel:
+        await ensure_waiting_voice_task(member.guild)
+
+
+# ============================================================
 # PRÉSENCE ET AVATAR
 # ============================================================
 
@@ -1062,6 +1374,12 @@ async def on_ready() -> None:
             logger.exception(
                 "Impossible d'envoyer le message de reconnexion dans le salon status."
             )
+
+
+    # Si Render ou Discord a redémarré pendant qu'une personne attendait,
+    # René reprend automatiquement la boucle sonore.
+    for guild in bot.guilds:
+        await ensure_waiting_voice_task(guild)
 
 
 # ============================================================
@@ -1664,6 +1982,7 @@ async def on_message(message: discord.Message) -> None:
     salon_anciennete="Salon du classement d'ancienneté",
     salon_questions="Salon où les membres posent leurs questions",
     role_moderateur="Rôle autorisé à répondre aux questions",
+    vocal_attente="Vocal où René joue ATTENTE.mp3 en boucle",
 )
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
@@ -1675,6 +1994,7 @@ async def config_command(
     salon_anciennete: discord.TextChannel | None = None,
     salon_questions: discord.TextChannel | None = None,
     role_moderateur: discord.Role | None = None,
+    vocal_attente: discord.VoiceChannel | None = None,
 ) -> None:
     assert interaction.guild is not None
 
@@ -1694,11 +2014,15 @@ async def config_command(
         config["questions_channel_id"] = salon_questions.id
     if role_moderateur is not None:
         config["moderator_role_id"] = role_moderateur.id
+    if vocal_attente is not None:
+        config["waiting_voice_channel_id"] = vocal_attente.id
 
     save_json(CONFIG_FILE, bot.config_data)
 
     if salon_anciennete is not None:
         await update_seniority_board(interaction.guild)
+    if vocal_attente is not None:
+        await ensure_waiting_voice_task(interaction.guild)
 
     await asyncio.sleep(0.6)
 
@@ -1718,7 +2042,9 @@ async def config_command(
             f"❓ **Questions :** "
             f"{f'<#{config.get('questions_channel_id')}>' if config.get('questions_channel_id') else 'non configuré'}\n"
             f"🛡️ **Rôle modérateur :** "
-            f"{f'<@&{config.get('moderator_role_id')}>' if config.get('moderator_role_id') else 'non configuré'}"
+            f"{f'<@&{config.get('moderator_role_id')}>' if config.get('moderator_role_id') else 'non configuré'}\n"
+            f"🔊 **Vocal d'attente :** "
+            f"{f'<#{config.get('waiting_voice_channel_id')}>' if config.get('waiting_voice_channel_id') else 'non configuré'}"
         ),
     )
 
@@ -1772,6 +2098,37 @@ async def questions_channel_command(
         description=(
             f"Les questions des membres seront maintenant prises en charge dans "
             f"{salon.mention}."
+        ),
+    )
+
+
+@bot.tree.command(
+    name="vocalattente",
+    description="Définir le vocal d'attente urgente.",
+)
+@app_commands.describe(salon="Vocal dans lequel ATTENTE.mp3 sera joué en boucle")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def waiting_voice_command(
+    interaction: discord.Interaction,
+    salon: discord.VoiceChannel,
+) -> None:
+    assert interaction.guild is not None
+
+    await begin_interaction_thinking(interaction)
+    config = bot.get_guild_config(interaction.guild.id)
+    config["waiting_voice_channel_id"] = salon.id
+    save_json(CONFIG_FILE, bot.config_data)
+    await ensure_waiting_voice_task(interaction.guild)
+
+    await finish_interaction(
+        interaction,
+        title="C'est noté !",
+        description=(
+            f"Le vocal d'attente est maintenant {salon.mention}.\n\n"
+            "Quand un membre y entre, René rejoint le vocal, joue "
+            "`ATTENTE.mp3` en boucle et prévient les modérateurs en MP "
+            "à chaque redémarrage du son."
         ),
     )
 
@@ -2049,6 +2406,7 @@ if __name__ == "__main__":
             "Ajoute-la dans Render > Environment."
         )
 
+    logger.info("Démarrage du serveur web Render...")
     web_thread = threading.Thread(
         target=run_web_server,
         name="rene-web-server",
@@ -2056,4 +2414,5 @@ if __name__ == "__main__":
     )
     web_thread.start()
 
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    logger.info("Connexion de René à Discord...")
+    bot.run(DISCORD_TOKEN.strip(), log_handler=None)
