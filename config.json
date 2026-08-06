@@ -1,0 +1,26 @@
+{
+  "1461042947410886689": {
+    "welcome_channel_id": 1461043384515825818,
+    "announcement_channel_id": 1461049254184489102,
+    "staff_records_channel_id": 1461043384515825821,
+    "allowed_domains": [
+      "cdn.discordapp.com",
+      "create.roblox.com",
+      "devforum.roblox.com",
+      "discord.com",
+      "discordapp.com",
+      "giphy.com",
+      "github.com",
+      "instagram.com",
+      "media.discordapp.net",
+      "roblox.com",
+      "tenor.com",
+      "tiktok.com",
+      "twitch.tv",
+      "twitter.com",
+      "x.com",
+      "youtu.be",
+      "youtube.com"
+    ]
+  }
+}
