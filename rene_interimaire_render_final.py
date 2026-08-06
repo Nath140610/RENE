@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -100,6 +101,8 @@ DISCORD_BAN_DURATION = timedelta(days=1)
 FAKE_ROBLOX_BAN_DAYS = 10
 DM_DELAY_SECONDS = 0.8
 STATUS_CHANNEL_ID = 1373577090213085204
+CONFIG_BACKUP_MARKER = "RENE_CONFIG_BACKUP_V1"
+CONFIG_BACKUP_FILENAME = "rene_config_backup.json"
 VOICE_CONNECT_TIMEOUT_SECONDS = 25.0
 VOICE_RETRY_DELAY_SECONDS = 5.0
 
@@ -570,6 +573,9 @@ class ReneBot(commands.Bot):
         self.last_task_until: datetime | None = None
         self.presence_lock = asyncio.Lock()
         self.waiting_voice_tasks: dict[int, asyncio.Task[None]] = {}
+        self.waiting_voice_locks: dict[int, asyncio.Lock] = {}
+        self.remote_config_loaded = False
+        self.remote_config_message_id: int | None = None
         self.stopping = False
 
     async def setup_hook(self) -> None:
@@ -640,6 +646,190 @@ class ReneBot(commands.Bot):
 
 bot = ReneBot()
 
+
+
+
+# ============================================================
+# SAUVEGARDE PERSISTANTE DE LA CONFIGURATION DANS DISCORD
+# ============================================================
+
+async def get_persistence_channel() -> discord.TextChannel | None:
+    channel = bot.get_channel(STATUS_CHANNEL_ID)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(STATUS_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def find_remote_config_message(
+    channel: discord.TextChannel,
+) -> discord.Message | None:
+    if bot.remote_config_message_id:
+        try:
+            return await channel.fetch_message(bot.remote_config_message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            bot.remote_config_message_id = None
+
+    try:
+        pinned_messages = await channel.pins()
+    except (discord.Forbidden, discord.HTTPException):
+        pinned_messages = []
+
+    for message in pinned_messages:
+        if (
+            bot.user is not None
+            and message.author.id == bot.user.id
+            and CONFIG_BACKUP_MARKER in message.content
+        ):
+            bot.remote_config_message_id = message.id
+            return message
+
+    try:
+        async for message in channel.history(limit=100):
+            if (
+                bot.user is not None
+                and message.author.id == bot.user.id
+                and CONFIG_BACKUP_MARKER in message.content
+            ):
+                bot.remote_config_message_id = message.id
+                return message
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    return None
+
+
+async def load_config_from_discord() -> bool:
+    if bot.user is None:
+        return False
+
+    channel = await get_persistence_channel()
+    if channel is None:
+        logger.warning(
+            "Impossible d'accéder au salon de sauvegarde %s.",
+            STATUS_CHANNEL_ID,
+        )
+        return False
+
+    message = await find_remote_config_message(channel)
+    if message is None:
+        logger.info("Aucune sauvegarde distante de /config trouvée.")
+        return False
+
+    attachment = next(
+        (
+            item
+            for item in message.attachments
+            if item.filename == CONFIG_BACKUP_FILENAME
+        ),
+        None,
+    )
+
+    if attachment is None:
+        logger.warning(
+            "Le message de sauvegarde existe, mais son fichier JSON est absent."
+        )
+        return False
+
+    try:
+        raw_data = await attachment.read()
+        loaded_data = json.loads(raw_data.decode("utf-8"))
+
+        if not isinstance(loaded_data, dict):
+            raise ValueError("La sauvegarde ne contient pas un objet JSON.")
+
+        bot.config_data = loaded_data
+        save_json(CONFIG_FILE, bot.config_data)
+        bot.remote_config_message_id = message.id
+
+        logger.info(
+            "Configuration persistante rechargée depuis Discord (%s serveur(s)).",
+            len(bot.config_data),
+        )
+        return True
+
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        discord.HTTPException,
+    ):
+        logger.exception("Impossible de recharger la configuration distante.")
+        return False
+
+
+async def persist_config_to_discord() -> bool:
+    if bot.user is None:
+        return False
+
+    channel = await get_persistence_channel()
+    if channel is None:
+        logger.warning(
+            "Sauvegarde distante impossible : salon %s inaccessible.",
+            STATUS_CHANNEL_ID,
+        )
+        return False
+
+    payload = json.dumps(
+        bot.config_data,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+    backup_file = discord.File(
+        io.BytesIO(payload),
+        filename=CONFIG_BACKUP_FILENAME,
+    )
+
+    content = (
+        f"`{CONFIG_BACKUP_MARKER}`\n"
+        "🗄️ **Sauvegarde interne de René**\n"
+        "Ce message conserve `/config` après les redémarrages de Render. "
+        "Merci de ne pas le supprimer."
+    )
+
+    message = await find_remote_config_message(channel)
+
+    try:
+        if message is None:
+            message = await channel.send(
+                content=content,
+                file=backup_file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            bot.remote_config_message_id = message.id
+
+            try:
+                await message.pin(
+                    reason="Sauvegarde persistante de la configuration de René"
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning(
+                    "La sauvegarde fonctionne, mais René n'a pas pu "
+                    "épingler son message."
+                )
+        else:
+            await message.edit(
+                content=content,
+                attachments=[backup_file],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        logger.info("Configuration sauvegardée durablement dans Discord.")
+        return True
+
+    except discord.HTTPException:
+        logger.exception("Impossible de sauvegarder /config dans Discord.")
+        return False
+
+
+async def save_config_persistently() -> None:
+    save_json(CONFIG_FILE, bot.config_data)
+    await persist_config_to_discord()
 
 
 # ============================================================
@@ -822,7 +1012,7 @@ async def update_seniority_board(guild: discord.Guild) -> None:
     if message is None:
         message = await channel.send(embed=embed)
         config["seniority_message_id"] = message.id
-        save_json(CONFIG_FILE, bot.config_data)
+        await save_config_persistently()
     else:
         await message.edit(embed=embed)
 
@@ -1078,8 +1268,6 @@ def get_configured_moderators(guild: discord.Guild) -> list[discord.Member]:
                     moderators.append(member)
                     seen.add(member.id)
 
-    # Secours : si aucun rôle n'est configuré ou qu'il est vide,
-    # René prévient les membres qui peuvent gérer les messages.
     if not moderators:
         for member in guild.members:
             if (
@@ -1097,11 +1285,16 @@ def get_configured_moderators(guild: discord.Guild) -> list[discord.Member]:
 
 
 def waiting_members(channel: discord.VoiceChannel) -> list[discord.Member]:
-    """Membres non-bots et non-modérateurs réellement en attente."""
+    """
+    Toutes les personnes humaines dans le vocal d'attente.
+
+    Les modérateurs sont inclus afin de permettre les tests avec un compte
+    staff et d'éviter les boucles de connexion/déconnexion.
+    """
     return [
         member
         for member in channel.members
-        if not member.bot and not member_has_moderator_role(member)
+        if not member.bot
     ]
 
 
@@ -1156,8 +1349,29 @@ async def notify_moderators_waiting(
     return sent, failed
 
 
+async def disconnect_waiting_voice(guild: discord.Guild) -> None:
+    voice_client = guild.voice_client
+
+    if voice_client is None:
+        return
+
+    try:
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+
+        if voice_client.is_connected():
+            await voice_client.disconnect(force=True)
+
+    except (discord.ClientException, discord.HTTPException):
+        logger.exception(
+            "Erreur pendant la déconnexion vocale du serveur %s.",
+            guild.id,
+        )
+
+
 async def waiting_voice_loop(guild: discord.Guild) -> None:
     cycle_number = 0
+    current_task = asyncio.current_task()
 
     try:
         while not bot.stopping:
@@ -1171,6 +1385,8 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
             if not isinstance(channel, discord.VoiceChannel):
                 break
 
+            await asyncio.sleep(0.75)
+
             members = waiting_members(channel)
             if not members:
                 break
@@ -1180,12 +1396,12 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
                     "Le fichier ATTENTE.mp3 est introuvable dans %s.",
                     BASE_DIR,
                 )
-                # Une seule alerte utile au lieu d'une boucle ultra-rapide.
+
                 for moderator in get_configured_moderators(guild):
                     try:
                         await moderator.send(
                             "❌ René ne trouve pas `ATTENTE.mp3`. "
-                            "Ajoute le fichier dans le même dossier que le script."
+                            "Ajoute-le dans le même dossier que le script."
                         )
                     except (discord.Forbidden, discord.HTTPException):
                         pass
@@ -1200,9 +1416,18 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
                         reconnect=True,
                         self_deaf=True,
                     )
+                elif voice_client.channel is None:
+                    await disconnect_waiting_voice(guild)
+                    await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
+                    continue
                 elif voice_client.channel.id != channel.id:
                     await voice_client.move_to(channel)
-            except (asyncio.TimeoutError, discord.ClientException, discord.HTTPException):
+
+            except (
+                asyncio.TimeoutError,
+                discord.ClientException,
+                discord.HTTPException,
+            ):
                 logger.exception(
                     "Impossible de rejoindre le vocal d'attente du serveur %s.",
                     guild.id,
@@ -1210,17 +1435,24 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
                 await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
                 continue
 
-            # Si le son précédent est encore actif, on attend sa fin.
-            while voice_client.is_playing() or voice_client.is_paused():
-                await asyncio.sleep(0.25)
+            while (
+                voice_client.is_connected()
+                and (voice_client.is_playing() or voice_client.is_paused())
+            ):
+                if not waiting_members(channel):
+                    voice_client.stop()
+                    break
+                await asyncio.sleep(0.3)
+
+            if not waiting_members(channel):
+                break
 
             cycle_number += 1
 
-            # À CHAQUE redémarrage du son, René renvoie l'alerte en MP.
             await notify_moderators_waiting(
                 guild,
                 channel,
-                members,
+                waiting_members(channel),
                 cycle_number,
             )
 
@@ -1243,54 +1475,85 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
                     options="-vn",
                 )
                 voice_client.play(source, after=after_playback)
-                await playback_finished.wait()
-            except (discord.ClientException, OSError, RuntimeError):
+
+                while not playback_finished.is_set():
+                    if not waiting_members(channel):
+                        if voice_client.is_playing() or voice_client.is_paused():
+                            voice_client.stop()
+                        break
+
+                    try:
+                        await asyncio.wait_for(
+                            playback_finished.wait(),
+                            timeout=1.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+            except (
+                discord.ClientException,
+                OSError,
+                RuntimeError,
+            ):
                 logger.exception("Impossible de lire ATTENTE.mp3.")
                 await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
 
     except asyncio.CancelledError:
         raise
-    finally:
-        voice_client = guild.voice_client
-        if voice_client is not None:
-            try:
-                if voice_client.is_playing() or voice_client.is_paused():
-                    voice_client.stop()
-                await voice_client.disconnect(force=True)
-            except discord.HTTPException:
-                pass
 
-        bot.waiting_voice_tasks.pop(guild.id, None)
+    finally:
+        await disconnect_waiting_voice(guild)
+
+        if bot.waiting_voice_tasks.get(guild.id) is current_task:
+            bot.waiting_voice_tasks.pop(guild.id, None)
 
 
 async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
-    config = bot.get_guild_config(guild.id)
-    channel_id = config.get("waiting_voice_channel_id")
+    """
+    Démarre ou arrête le vocal d'attente sans lancer plusieurs boucles.
+    """
+    lock = bot.waiting_voice_locks.setdefault(guild.id, asyncio.Lock())
 
-    if not channel_id:
-        return
+    async with lock:
+        config = bot.get_guild_config(guild.id)
+        channel_id = config.get("waiting_voice_channel_id")
 
-    channel = guild.get_channel(int(channel_id))
-    if not isinstance(channel, discord.VoiceChannel):
-        return
+        if not channel_id:
+            existing = bot.waiting_voice_tasks.get(guild.id)
+            if existing and not existing.done():
+                existing.cancel()
+                await asyncio.gather(existing, return_exceptions=True)
 
-    if not waiting_members(channel):
+            bot.waiting_voice_tasks.pop(guild.id, None)
+            await disconnect_waiting_voice(guild)
+            return
+
+        channel = guild.get_channel(int(channel_id))
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+
+        await asyncio.sleep(1.0)
+
+        members = waiting_members(channel)
         existing = bot.waiting_voice_tasks.get(guild.id)
-        if existing and not existing.done():
-            voice_client = guild.voice_client
-            if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
-                voice_client.stop()
-        return
 
-    existing = bot.waiting_voice_tasks.get(guild.id)
-    if existing is not None and not existing.done():
-        return
+        if not members:
+            if existing and not existing.done():
+                existing.cancel()
+                await asyncio.gather(existing, return_exceptions=True)
 
-    task = asyncio.create_task(
-        waiting_voice_loop(guild),
-        name=f"waiting-voice-{guild.id}",
-    )
-    bot.waiting_voice_tasks[guild.id] = task
+            bot.waiting_voice_tasks.pop(guild.id, None)
+            await disconnect_waiting_voice(guild)
+            return
+
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(
+            waiting_voice_loop(guild),
+            name=f"waiting-voice-{guild.id}",
+        )
+        bot.waiting_voice_tasks[guild.id] = task
 
 
 @bot.event
@@ -1304,17 +1567,21 @@ async def on_voice_state_update(
 
     config = bot.get_guild_config(member.guild.id)
     channel_id = config.get("waiting_voice_channel_id")
+
     if not channel_id:
         return
 
     watched_id = int(channel_id)
-    changed_watched_channel = (
+    concerned = (
         (before.channel is not None and before.channel.id == watched_id)
         or (after.channel is not None and after.channel.id == watched_id)
     )
 
-    if changed_watched_channel:
-        await ensure_waiting_voice_task(member.guild)
+    if not concerned:
+        return
+
+    await asyncio.sleep(1.0)
+    await ensure_waiting_voice_task(member.guild)
 
 
 # ============================================================
@@ -1339,6 +1606,13 @@ async def on_ready() -> None:
         return
 
     logger.info("Connecté en tant que %s (%s).", bot.user, bot.user.id)
+
+    if not bot.remote_config_loaded:
+        bot.remote_config_loaded = True
+        loaded = await load_config_from_discord()
+
+        if not loaded:
+            await persist_config_to_discord()
 
     await bot.change_presence(
         status=discord.Status.online,
@@ -2017,7 +2291,7 @@ async def config_command(
     if vocal_attente is not None:
         config["waiting_voice_channel_id"] = vocal_attente.id
 
-    save_json(CONFIG_FILE, bot.config_data)
+    await save_config_persistently()
 
     if salon_anciennete is not None:
         await update_seniority_board(interaction.guild)
@@ -2065,7 +2339,7 @@ async def mod_define_command(
     await begin_interaction_thinking(interaction)
     config = bot.get_guild_config(interaction.guild.id)
     config["moderator_role_id"] = role.id
-    save_json(CONFIG_FILE, bot.config_data)
+    await save_config_persistently()
 
     await finish_interaction(
         interaction,
@@ -2090,7 +2364,7 @@ async def questions_channel_command(
     await begin_interaction_thinking(interaction)
     config = bot.get_guild_config(interaction.guild.id)
     config["questions_channel_id"] = salon.id
-    save_json(CONFIG_FILE, bot.config_data)
+    await save_config_persistently()
 
     await finish_interaction(
         interaction,
@@ -2118,7 +2392,7 @@ async def waiting_voice_command(
     await begin_interaction_thinking(interaction)
     config = bot.get_guild_config(interaction.guild.id)
     config["waiting_voice_channel_id"] = salon.id
-    save_json(CONFIG_FILE, bot.config_data)
+    await save_config_persistently()
     await ensure_waiting_voice_task(interaction.guild)
 
     await finish_interaction(
