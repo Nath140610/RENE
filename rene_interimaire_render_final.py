@@ -546,8 +546,10 @@ class ReneCommandTree(app_commands.CommandTree):
 class ReneBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
+        intents.guilds = True
         intents.members = True
         intents.message_content = True
+        intents.voice_states = True
         intents.voice_states = True
 
         super().__init__(
@@ -1411,6 +1413,11 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
 
             try:
                 if voice_client is None or not voice_client.is_connected():
+                    logger.info(
+                        "VOCAL : connexion de René au salon %s (%s).",
+                        channel.name,
+                        channel.id,
+                    )
                     voice_client = await channel.connect(
                         timeout=VOICE_CONNECT_TIMEOUT_SECONDS,
                         reconnect=True,
@@ -1449,6 +1456,12 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
 
             cycle_number += 1
 
+            logger.info(
+                "VOCAL : lancement du cycle audio n°%s dans %s.",
+                cycle_number,
+                channel.name,
+            )
+
             await notify_moderators_waiting(
                 guild,
                 channel,
@@ -1468,6 +1481,12 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
                 event_loop.call_soon_threadsafe(playback_finished.set)
 
             try:
+                logger.info(
+                    "VOCAL : lecture de %s avec FFmpeg=%s.",
+                    AUDIO_WAITING,
+                    get_ffmpeg_executable(),
+                )
+
                 source = discord.FFmpegOpusAudio(
                     str(AUDIO_WAITING),
                     executable=get_ffmpeg_executable(),
@@ -1512,6 +1531,11 @@ async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
     """
     Démarre ou arrête le vocal d'attente sans lancer plusieurs boucles.
     """
+    logger.info(
+        "VOCAL : vérification de la tâche d'attente pour le serveur %s.",
+        guild.id,
+    )
+
     lock = bot.waiting_voice_locks.setdefault(guild.id, asyncio.Lock())
 
     async with lock:
@@ -1519,6 +1543,9 @@ async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
         channel_id = config.get("waiting_voice_channel_id")
 
         if not channel_id:
+            logger.warning(
+                "VOCAL : aucune configuration de vocal d'attente, arrêt de la tâche."
+            )
             existing = bot.waiting_voice_tasks.get(guild.id)
             if existing and not existing.done():
                 existing.cancel()
@@ -1530,6 +1557,10 @@ async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
 
         channel = guild.get_channel(int(channel_id))
         if not isinstance(channel, discord.VoiceChannel):
+            logger.error(
+                "VOCAL : le salon configuré %s n'existe pas ou n'est pas vocal.",
+                channel_id,
+            )
             return
 
         await asyncio.sleep(1.0)
@@ -1538,6 +1569,9 @@ async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
         existing = bot.waiting_voice_tasks.get(guild.id)
 
         if not members:
+            logger.info(
+                "VOCAL : aucun humain présent, René quitte ou reste déconnecté."
+            )
             if existing and not existing.done():
                 existing.cancel()
                 await asyncio.gather(existing, return_exceptions=True)
@@ -1547,7 +1581,15 @@ async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
             return
 
         if existing is not None and not existing.done():
+            logger.info(
+                "VOCAL : une tâche d'attente existe déjà, aucune nouvelle tâche créée."
+            )
             return
+
+        logger.info(
+            "VOCAL : création de la boucle d'attente pour %s humain(s).",
+            len(members),
+        )
 
         task = asyncio.create_task(
             waiting_voice_loop(guild),
@@ -1562,25 +1604,81 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after: discord.VoiceState,
 ) -> None:
-    if member.bot or bot.stopping:
+    before_id = before.channel.id if before.channel else None
+    after_id = after.channel.id if after.channel else None
+
+    logger.info(
+        "VOCAL : membre=%s (%s) avant=%s après=%s",
+        member,
+        member.id,
+        before_id,
+        after_id,
+    )
+
+    if member.bot:
+        logger.info("VOCAL : événement ignoré car le membre est un bot.")
+        return
+
+    if bot.stopping:
+        logger.info("VOCAL : événement ignoré car René est en arrêt.")
         return
 
     config = bot.get_guild_config(member.guild.id)
     channel_id = config.get("waiting_voice_channel_id")
 
+    logger.info(
+        "VOCAL : serveur=%s salon_attente_configuré=%s",
+        member.guild.id,
+        channel_id,
+    )
+
     if not channel_id:
+        logger.warning(
+            "VOCAL : aucun salon d'attente configuré pour le serveur %s.",
+            member.guild.id,
+        )
         return
 
-    watched_id = int(channel_id)
-    concerned = (
-        (before.channel is not None and before.channel.id == watched_id)
-        or (after.channel is not None and after.channel.id == watched_id)
+    try:
+        watched_id = int(channel_id)
+    except (TypeError, ValueError):
+        logger.error(
+            "VOCAL : identifiant de salon invalide dans la configuration : %r",
+            channel_id,
+        )
+        return
+
+    concerned = before_id == watched_id or after_id == watched_id
+
+    logger.info(
+        "VOCAL : salon surveillé=%s événement_concerné=%s",
+        watched_id,
+        concerned,
     )
 
     if not concerned:
         return
 
-    await asyncio.sleep(1.0)
+    # Discord met parfois un court instant à actualiser channel.members.
+    await asyncio.sleep(1.25)
+
+    channel = member.guild.get_channel(watched_id)
+
+    if not isinstance(channel, discord.VoiceChannel):
+        logger.error(
+            "VOCAL : le salon configuré %s est introuvable ou n'est pas vocal.",
+            watched_id,
+        )
+        return
+
+    humans = waiting_members(channel)
+
+    logger.info(
+        "VOCAL : humains présents dans %s = %s",
+        channel.name,
+        [f"{human.display_name} ({human.id})" for human in humans],
+    )
+
     await ensure_waiting_voice_task(member.guild)
 
 
