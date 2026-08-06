@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
+import hashlib
 import io
 import json
 import logging
@@ -8,13 +11,17 @@ import os
 import random
 import re
 import threading
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, jsonify
+from waitress import serve
 import imageio_ffmpeg
 
 import discord
@@ -44,6 +51,8 @@ from discord.ext import commands, tasks
 # Active dans le portail développeur Discord :
 #   - SERVER MEMBERS INTENT
 #   - MESSAGE CONTENT INTENT
+#
+# Aucun réglage OAuth2 RPC vocal n'est nécessaire.
 #
 # Le bannissement Roblox est uniquement simulé.
 # ============================================================
@@ -101,10 +110,14 @@ DISCORD_BAN_DURATION = timedelta(days=1)
 FAKE_ROBLOX_BAN_DAYS = 10
 DM_DELAY_SECONDS = 0.8
 STATUS_CHANNEL_ID = 1373577090213085204
-CONFIG_BACKUP_MARKER = "RENE_CONFIG_BACKUP_V1"
-CONFIG_BACKUP_FILENAME = "rene_config_backup.json"
-VOICE_CONNECT_TIMEOUT_SECONDS = 25.0
-VOICE_RETRY_DELAY_SECONDS = 5.0
+STATE_BACKUP_MARKER = "RENE_STATE_BACKUP_V3"
+STATE_BACKUP_FILENAME = "rene_state_backup.bin"
+LEGACY_CONFIG_BACKUP_MARKER = "RENE_CONFIG_BACKUP_V1"
+LEGACY_CONFIG_BACKUP_FILENAME = "rene_config_backup.json"
+VOICE_CONNECT_TIMEOUT_SECONDS = 20.0
+VOICE_CONNECT_ATTEMPTS = 4
+VOICE_RETRY_DELAY_SECONDS = 3.0
+REMOTE_BACKUP_DELAY_SECONDS = 2.5
 
 WELCOME_MESSAGE = (
     "Bienvenue {mention}, amuse-toi bien dans **VoidLoop's Studio** !"
@@ -120,6 +133,7 @@ WARNING_MESSAGE = (
 BAD_WORDS = {
     "fdp",
     "ntm",
+    "tg",
     "pute",
     "putain",
     "salope",
@@ -158,7 +172,7 @@ DEFAULT_ALLOWED_DOMAINS = {
 }
 
 URL_PATTERN = re.compile(
-    r"(?i)\b("
+    r"(?i)(?<!@)\b("
     r"(?:https?://|www\.)[^\s<>()]+"
     r"|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s<>()]*)?"
     r")"
@@ -334,6 +348,7 @@ async def send_embed_with_thumbnail(
     description: str,
     color: discord.Color,
     image_path: Path,
+    content: str | None = None,
     allowed_mentions: discord.AllowedMentions | None = None,
 ) -> discord.Message:
     embed = build_embed(title, description, color)
@@ -348,11 +363,43 @@ async def send_embed_with_thumbnail(
         ),
     }
 
+    if content is not None:
+        arguments["content"] = content
+
     if file is not None:
         embed.set_thumbnail(url="attachment://rene_status.png")
         arguments["file"] = file
 
     return await destination.send(**arguments)
+
+
+async def reply_embed_with_thumbnail(
+    message: discord.Message,
+    *,
+    title: str,
+    description: str,
+    color: discord.Color,
+    image_path: Path,
+    allowed_mentions: discord.AllowedMentions | None = None,
+) -> discord.Message:
+    embed = build_embed(title, description, color)
+    file = image_attachment(image_path)
+
+    arguments: dict[str, Any] = {
+        "embed": embed,
+        "mention_author": False,
+        "allowed_mentions": (
+            allowed_mentions
+            if allowed_mentions is not None
+            else discord.AllowedMentions.none()
+        ),
+    }
+
+    if file is not None:
+        embed.set_thumbnail(url="attachment://rene_status.png")
+        arguments["file"] = file
+
+    return await message.reply(**arguments)
 
 
 async def edit_embed_with_thumbnail(
@@ -484,26 +531,42 @@ async def animate_warning_file(
 web_app = Flask(__name__)
 
 
+def current_web_status() -> str:
+    try:
+        if bot.stopping:
+            return "sleeping"
+        if bot_is_ready():
+            return "online"
+    except NameError:
+        pass
+    return "starting"
+
+
 @web_app.get("/")
 def web_home():
+    status = current_web_status()
     return jsonify(
         {
             "bot": "René L'Intérimaire",
             "studio": "VoidLoop Studio",
-            "status": "online" if bot_is_ready() else "starting",
+            "status": status,
         }
     ), 200
 
 
 @web_app.get("/health")
 def web_health():
+    status = current_web_status()
     return jsonify(
         {
             "ok": True,
+            "status": status,
             "discord_ready": bot_is_ready(),
             "message": (
                 "René est en service !"
-                if bot_is_ready()
+                if status == "online"
+                else "René dort volontairement."
+                if status == "sleeping"
                 else "René démarre..."
             ),
         }
@@ -519,12 +582,12 @@ def bot_is_ready() -> bool:
 
 def run_web_server() -> None:
     port = int(os.environ.get("PORT", "10000"))
-
-    web_app.run(
+    serve(
+        web_app,
         host="0.0.0.0",
         port=port,
-        debug=False,
-        use_reloader=False,
+        threads=2,
+        clear_untrusted_proxy_headers=True,
     )
 
 
@@ -549,7 +612,6 @@ class ReneBot(commands.Bot):
         intents.guilds = True
         intents.members = True
         intents.message_content = True
-        intents.voice_states = True
         intents.voice_states = True
 
         super().__init__(
@@ -576,22 +638,32 @@ class ReneBot(commands.Bot):
         self.presence_lock = asyncio.Lock()
         self.waiting_voice_tasks: dict[int, asyncio.Task[None]] = {}
         self.waiting_voice_locks: dict[int, asyncio.Lock] = {}
-        self.remote_config_loaded = False
-        self.remote_config_message_id: int | None = None
+        self.voice_connect_locks: dict[int, asyncio.Lock] = {}
+        self.question_locks: dict[tuple[int, str], asyncio.Lock] = {}
+        self.remote_state_loaded = False
+        self.remote_state_message_id: int | None = None
+        self.state_backup_task: asyncio.Task[None] | None = None
+        self.state_backup_dirty = False
         self.stopping = False
 
     async def setup_hook(self) -> None:
         synced_commands = await self.tree.sync()
         logger.info("%s commandes synchronisées.", len(synced_commands))
 
-        if not temporary_ban_checker.is_running():
-            temporary_ban_checker.start()
-        if not funny_presence_loop.is_running():
-            funny_presence_loop.start()
-        if not seniority_refresh_loop.is_running():
-            seniority_refresh_loop.start()
-
     async def close(self) -> None:
+        if self.state_backup_task and not self.state_backup_task.done():
+            self.state_backup_task.cancel()
+            await asyncio.gather(self.state_backup_task, return_exceptions=True)
+
+        if self.remote_state_loaded and self.user is not None:
+            try:
+                await asyncio.wait_for(
+                    persist_state_to_discord(),
+                    timeout=12.0,
+                )
+            except (asyncio.TimeoutError, discord.HTTPException):
+                logger.exception("La sauvegarde finale de René a échoué.")
+
         if temporary_ban_checker.is_running():
             temporary_ban_checker.cancel()
         if funny_presence_loop.is_running():
@@ -608,11 +680,8 @@ class ReneBot(commands.Bot):
             )
         self.waiting_voice_tasks.clear()
 
-        for voice_client in list(self.voice_clients):
-            try:
-                await voice_client.disconnect(force=True)
-            except discord.HTTPException:
-                pass
+        for guild in list(self.guilds):
+            await disconnect_waiting_voice(guild)
 
         await super().close()
 
@@ -652,8 +721,102 @@ bot = ReneBot()
 
 
 # ============================================================
-# SAUVEGARDE PERSISTANTE DE LA CONFIGURATION DANS DISCORD
+# SAUVEGARDE PERSISTANTE ET CHIFFRÉE DANS DISCORD
 # ============================================================
+
+def write_all_local_state() -> None:
+    save_json(CONFIG_FILE, bot.config_data)
+    save_json(WARNINGS_FILE, bot.warning_data)
+    save_json(ROBLOX_LINKS_FILE, bot.roblox_links)
+    save_json(TEMP_BANS_FILE, bot.temporary_bans)
+    save_json(CASES_FILE, bot.moderation_cases)
+    save_json(DEPARTED_MEMBERS_FILE, bot.departed_members)
+    save_json(QUESTIONS_FILE, bot.questions)
+
+
+def build_state_snapshot() -> dict[str, Any]:
+    return {
+        "version": 3,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "config": bot.config_data,
+        "warnings": bot.warning_data,
+        "roblox_links": bot.roblox_links,
+        "temporary_bans": bot.temporary_bans,
+        "moderation_cases": bot.moderation_cases,
+        "departed_members": bot.departed_members,
+        "questions": bot.questions,
+    }
+
+
+def apply_state_snapshot(snapshot: dict[str, Any]) -> None:
+    mapping = {
+        "config": "config_data",
+        "warnings": "warning_data",
+        "roblox_links": "roblox_links",
+        "temporary_bans": "temporary_bans",
+        "moderation_cases": "moderation_cases",
+        "departed_members": "departed_members",
+        "questions": "questions",
+    }
+
+    for key, attribute in mapping.items():
+        value = snapshot.get(key)
+        if isinstance(value, dict):
+            setattr(bot, attribute, value)
+
+    write_all_local_state()
+
+
+def build_state_cipher(secret: str) -> Fernet:
+    digest = hashlib.sha256(secret.strip().encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def get_primary_state_cipher() -> Fernet:
+    # STATE_SECRET est recommandé. Sinon, le token Discord est utilisé.
+    secret = os.getenv("STATE_SECRET") or DISCORD_TOKEN or "rene-local-fallback"
+    return build_state_cipher(secret)
+
+
+def get_state_decryption_ciphers() -> list[Fernet]:
+    # Permet de définir STATE_SECRET sans perdre une ancienne sauvegarde
+    # qui avait été chiffrée avec le token Discord.
+    secrets: list[str] = []
+    for candidate in (
+        os.getenv("STATE_SECRET"),
+        DISCORD_TOKEN,
+        "rene-local-fallback",
+    ):
+        if candidate and candidate.strip() not in secrets:
+            secrets.append(candidate.strip())
+    return [build_state_cipher(secret) for secret in secrets]
+
+
+def encode_state_snapshot(snapshot: dict[str, Any]) -> bytes:
+    raw = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=6)
+    return get_primary_state_cipher().encrypt(compressed)
+
+
+def decode_state_snapshot(payload: bytes) -> dict[str, Any]:
+    last_error: InvalidToken | None = None
+    for cipher in get_state_decryption_ciphers():
+        try:
+            decrypted = cipher.decrypt(payload)
+            raw = gzip.decompress(decrypted)
+            decoded = json.loads(raw.decode("utf-8"))
+            if not isinstance(decoded, dict):
+                raise ValueError("La sauvegarde distante est invalide.")
+            return decoded
+        except InvalidToken as error:
+            last_error = error
+
+    raise last_error or InvalidToken
+
 
 async def get_persistence_channel() -> discord.TextChannel | None:
     channel = bot.get_channel(STATUS_CHANNEL_ID)
@@ -667,37 +830,44 @@ async def get_persistence_channel() -> discord.TextChannel | None:
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
-async def find_remote_config_message(
+async def iter_pinned_messages(
     channel: discord.TextChannel,
-) -> discord.Message | None:
-    if bot.remote_config_message_id:
-        try:
-            return await channel.fetch_message(bot.remote_config_message_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            bot.remote_config_message_id = None
-
+) -> list[discord.Message]:
     try:
-        pinned_messages = await channel.pins()
+        return [message async for message in channel.pins()]
     except (discord.Forbidden, discord.HTTPException):
-        pinned_messages = []
+        return []
 
-    for message in pinned_messages:
+
+async def find_backup_message(
+    channel: discord.TextChannel,
+    marker: str,
+) -> discord.Message | None:
+    if marker == STATE_BACKUP_MARKER and bot.remote_state_message_id:
+        try:
+            return await channel.fetch_message(bot.remote_state_message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            bot.remote_state_message_id = None
+
+    for message in await iter_pinned_messages(channel):
         if (
             bot.user is not None
             and message.author.id == bot.user.id
-            and CONFIG_BACKUP_MARKER in message.content
+            and marker in message.content
         ):
-            bot.remote_config_message_id = message.id
+            if marker == STATE_BACKUP_MARKER:
+                bot.remote_state_message_id = message.id
             return message
 
     try:
-        async for message in channel.history(limit=100):
+        async for message in channel.history(limit=150):
             if (
                 bot.user is not None
                 and message.author.id == bot.user.id
-                and CONFIG_BACKUP_MARKER in message.content
+                and marker in message.content
             ):
-                bot.remote_config_message_id = message.id
+                if marker == STATE_BACKUP_MARKER:
+                    bot.remote_state_message_id = message.id
                 return message
     except (discord.Forbidden, discord.HTTPException):
         pass
@@ -705,7 +875,38 @@ async def find_remote_config_message(
     return None
 
 
-async def load_config_from_discord() -> bool:
+async def load_legacy_config_backup(
+    channel: discord.TextChannel,
+) -> bool:
+    message = await find_backup_message(channel, LEGACY_CONFIG_BACKUP_MARKER)
+    if message is None:
+        return False
+
+    attachment = next(
+        (
+            item
+            for item in message.attachments
+            if item.filename == LEGACY_CONFIG_BACKUP_FILENAME
+        ),
+        None,
+    )
+    if attachment is None:
+        return False
+
+    try:
+        data = json.loads((await attachment.read()).decode("utf-8"))
+        if not isinstance(data, dict):
+            return False
+        bot.config_data = data
+        write_all_local_state()
+        logger.info("Ancienne sauvegarde /config migrée avec succès.")
+        return True
+    except (UnicodeDecodeError, json.JSONDecodeError, discord.HTTPException):
+        logger.exception("Impossible de migrer l'ancienne sauvegarde /config.")
+        return False
+
+
+async def load_state_from_discord() -> bool:
     if bot.user is None:
         return False
 
@@ -717,54 +918,52 @@ async def load_config_from_discord() -> bool:
         )
         return False
 
-    message = await find_remote_config_message(channel)
+    message = await find_backup_message(channel, STATE_BACKUP_MARKER)
     if message is None:
-        logger.info("Aucune sauvegarde distante de /config trouvée.")
-        return False
+        return await load_legacy_config_backup(channel)
 
     attachment = next(
         (
             item
             for item in message.attachments
-            if item.filename == CONFIG_BACKUP_FILENAME
+            if item.filename == STATE_BACKUP_FILENAME
         ),
         None,
     )
-
     if attachment is None:
-        logger.warning(
-            "Le message de sauvegarde existe, mais son fichier JSON est absent."
-        )
+        logger.warning("Le fichier de sauvegarde de René est absent.")
         return False
 
     try:
-        raw_data = await attachment.read()
-        loaded_data = json.loads(raw_data.decode("utf-8"))
-
-        if not isinstance(loaded_data, dict):
-            raise ValueError("La sauvegarde ne contient pas un objet JSON.")
-
-        bot.config_data = loaded_data
-        save_json(CONFIG_FILE, bot.config_data)
-        bot.remote_config_message_id = message.id
-
+        snapshot = decode_state_snapshot(await attachment.read())
+        apply_state_snapshot(snapshot)
+        bot.remote_state_message_id = message.id
         logger.info(
-            "Configuration persistante rechargée depuis Discord (%s serveur(s)).",
-            len(bot.config_data),
+            "État persistant rechargé depuis Discord (version %s).",
+            snapshot.get("version", "?"),
         )
         return True
-
+    except InvalidToken:
+        logger.error(
+            "La sauvegarde existe mais sa clé ne correspond plus. "
+            "Vérifie la variable STATE_SECRET. René conserve la sauvegarde "
+            "existante et ne l'écrase pas."
+        )
+        # True signifie ici : une sauvegarde existe, mais elle est illisible.
+        # Cela empêche on_ready de l'écraser avec un état vide.
+        return True
     except (
+        OSError,
+        ValueError,
         UnicodeDecodeError,
         json.JSONDecodeError,
-        ValueError,
         discord.HTTPException,
     ):
-        logger.exception("Impossible de recharger la configuration distante.")
+        logger.exception("Impossible de recharger l'état distant de René.")
         return False
 
 
-async def persist_config_to_discord() -> bool:
+async def persist_state_to_discord() -> bool:
     if bot.user is None:
         return False
 
@@ -776,25 +975,21 @@ async def persist_config_to_discord() -> bool:
         )
         return False
 
-    payload = json.dumps(
-        bot.config_data,
-        ensure_ascii=False,
-        indent=2,
-    ).encode("utf-8")
-
+    write_all_local_state()
+    payload = encode_state_snapshot(build_state_snapshot())
     backup_file = discord.File(
         io.BytesIO(payload),
-        filename=CONFIG_BACKUP_FILENAME,
+        filename=STATE_BACKUP_FILENAME,
     )
 
     content = (
-        f"`{CONFIG_BACKUP_MARKER}`\n"
-        "🗄️ **Sauvegarde interne de René**\n"
-        "Ce message conserve `/config` après les redémarrages de Render. "
-        "Merci de ne pas le supprimer."
+        f"`{STATE_BACKUP_MARKER}`\n"
+        "🔐 **Sauvegarde interne chiffrée de René**\n"
+        "Elle conserve la configuration, les avertissements et les dossiers "
+        "après les redémarrages de Render. Merci de ne pas la supprimer."
     )
 
-    message = await find_remote_config_message(channel)
+    message = await find_backup_message(channel, STATE_BACKUP_MARKER)
 
     try:
         if message is None:
@@ -803,35 +998,86 @@ async def persist_config_to_discord() -> bool:
                 file=backup_file,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            bot.remote_config_message_id = message.id
-
+            bot.remote_state_message_id = message.id
             try:
                 await message.pin(
-                    reason="Sauvegarde persistante de la configuration de René"
+                    reason="Sauvegarde persistante chiffrée de René"
                 )
             except (discord.Forbidden, discord.HTTPException):
                 logger.warning(
-                    "La sauvegarde fonctionne, mais René n'a pas pu "
-                    "épingler son message."
+                    "Sauvegarde créée, mais René n'a pas pu l'épingler."
                 )
         else:
-            await message.edit(
-                content=content,
-                attachments=[backup_file],
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            try:
+                await message.edit(
+                    content=content,
+                    attachments=[backup_file],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                # Recréation propre si Discord refuse le remplacement du fichier.
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+                message = await channel.send(
+                    content=content,
+                    file=discord.File(
+                        io.BytesIO(payload),
+                        filename=STATE_BACKUP_FILENAME,
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                bot.remote_state_message_id = message.id
+                try:
+                    await message.pin(
+                        reason="Sauvegarde persistante chiffrée de René"
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
 
-        logger.info("Configuration sauvegardée durablement dans Discord.")
+        logger.info("État de René sauvegardé durablement dans Discord.")
         return True
-
     except discord.HTTPException:
-        logger.exception("Impossible de sauvegarder /config dans Discord.")
+        logger.exception("Impossible de sauvegarder l'état de René dans Discord.")
         return False
 
 
-async def save_config_persistently() -> None:
-    save_json(CONFIG_FILE, bot.config_data)
-    await persist_config_to_discord()
+def schedule_state_backup(delay: float = REMOTE_BACKUP_DELAY_SECONDS) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    bot.state_backup_dirty = True
+    if bot.state_backup_task and not bot.state_backup_task.done():
+        return
+
+    async def worker() -> None:
+        try:
+            while bot.state_backup_dirty and not bot.stopping:
+                bot.state_backup_dirty = False
+                await asyncio.sleep(delay)
+                await persist_state_to_discord()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Erreur pendant la sauvegarde différée de René.")
+
+    bot.state_backup_task = loop.create_task(
+        worker(),
+        name="rene-state-backup",
+    )
+
+
+def save_runtime_json(path: Path, data: dict[str, Any]) -> None:
+    save_json(path, data)
+    schedule_state_backup()
+
+
+async def save_state_immediately() -> None:
+    write_all_local_state()
+    await persist_state_to_discord()
 
 
 # ============================================================
@@ -891,14 +1137,21 @@ async def before_funny_presence_loop() -> None:
 # CLASSEMENT D'ANCIENNETÉ
 # ============================================================
 
-def format_duration_since(date: datetime | None) -> str:
-    if date is None:
+def format_duration_between(
+    start: datetime | None,
+    end: datetime | None = None,
+) -> str:
+    if start is None:
         return "date inconnue"
 
-    now = datetime.now(timezone.utc)
-    delta = max(now - date, timedelta())
-    days = delta.days
+    end = end or datetime.now(timezone.utc)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
 
+    delta = max(end - start, timedelta())
+    days = delta.days
     years, remainder = divmod(days, 365)
     months, days_left = divmod(remainder, 30)
 
@@ -909,8 +1162,11 @@ def format_duration_since(date: datetime | None) -> str:
         parts.append(f"{months} mois")
     if not years and days_left:
         parts.append(f"{days_left} jour{'s' if days_left > 1 else ''}")
-
     return ", ".join(parts) or "aujourd'hui"
+
+
+def format_duration_since(date: datetime | None) -> str:
+    return format_duration_between(date)
 
 
 def oldest_current_members(guild: discord.Guild) -> list[discord.Member]:
@@ -970,22 +1226,24 @@ async def update_seniority_board(guild: discord.Guild) -> None:
         try:
             joined = datetime.fromisoformat(str(record["joined_at"]))
             joined_ts = int(joined.timestamp())
-            duration = format_duration_since(joined)
         except (ValueError, TypeError):
+            joined = None
             joined_ts = 0
-            duration = "date inconnue"
 
         left_text = ""
+        left: datetime | None = None
         try:
             left = datetime.fromisoformat(str(record.get("left_at", "")))
             left_text = f" • parti <t:{int(left.timestamp())}:R>"
         except (ValueError, TypeError):
             pass
 
+        duration = format_duration_between(joined, left)
+
         departed_lines.append(
             f"{prefix} **{record.get('display_name', 'Ancien membre')}** — "
             f"avait rejoint <t:{joined_ts}:D> "
-            f"(**{duration} depuis son arrivée**){left_text}"
+            f"(**présent pendant {duration}**){left_text}"
         )
 
     embed = build_embed(
@@ -1014,7 +1272,7 @@ async def update_seniority_board(guild: discord.Guild) -> None:
     if message is None:
         message = await channel.send(embed=embed)
         config["seniority_message_id"] = message.id
-        await save_config_persistently()
+        await save_state_immediately()
     else:
         await message.edit(embed=embed)
 
@@ -1040,17 +1298,44 @@ async def before_seniority_refresh_loop() -> None:
 def member_has_moderator_role(member: discord.Member) -> bool:
     config = bot.get_guild_config(member.guild.id)
     role_id = config.get("moderator_role_id")
-    return bool(
+    has_role = bool(
         role_id
         and any(role.id == int(role_id) for role in member.roles)
-    ) or member.guild_permissions.manage_messages
+    )
+    return (
+        has_role
+        or member.guild_permissions.manage_messages
+        or member.guild_permissions.administrator
+    )
 
 
 async def register_question(message: discord.Message) -> None:
     if message.guild is None:
         return
 
+    confirmation_message = await reply_embed_with_thumbnail(
+        message,
+        title="René réfléchit…",
+        description="Je transmets ta question au bon bureau.",
+        color=COLOR_INFO,
+        image_path=IMAGE_THINKING,
+    )
+
     guild_questions = bot.questions.setdefault(str(message.guild.id), {})
+
+    # Limite la taille de la sauvegarde : supprime d'abord les plus anciennes
+    # questions déjà traitées au-delà de 1 000 entrées par serveur.
+    if len(guild_questions) >= 1000:
+        answered_items = sorted(
+            (
+                (question_id, data)
+                for question_id, data in guild_questions.items()
+                if data.get("answered")
+            ),
+            key=lambda item: str(item[1].get("created_at", "")),
+        )
+        for question_id, _ in answered_items[: max(1, len(guild_questions) - 999)]:
+            guild_questions.pop(question_id, None)
 
     question_data: dict[str, Any] = {
         "question_message_id": message.id,
@@ -1062,42 +1347,36 @@ async def register_question(message: discord.Message) -> None:
         "answer": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "staff_notification_message_id": None,
-        "confirmation_message_id": None,
+        "confirmation_message_id": confirmation_message.id,
     }
-
     guild_questions[str(message.id)] = question_data
-    save_json(QUESTIONS_FILE, bot.questions)
+    save_runtime_json(QUESTIONS_FILE, bot.questions)
 
     config = bot.get_guild_config(message.guild.id)
     role_id = config.get("moderator_role_id")
     staff_channel_id = config.get("staff_records_channel_id")
-
     notify_channel = (
         message.guild.get_channel(int(staff_channel_id))
         if staff_channel_id
         else message.channel
     )
-
     if not isinstance(notify_channel, discord.TextChannel):
         notify_channel = message.channel
 
     role_mention = f"<@&{role_id}>" if role_id else "**Modérateurs**"
-
-    notification_message = await notify_channel.send(
+    notification_message = await send_embed_with_thumbnail(
+        notify_channel,
         content=f"📨 {role_mention}, une nouvelle question attend une réponse.",
-        embed=build_embed(
-            "Question reçue",
-            (
-                f"👤 **Auteur :** {message.author.mention}\n"
-                f"📍 **Question originale :** [ouvrir le message]({message.jump_url})\n\n"
-                f"**Question :**\n{message.content}\n\n"
-                "Pour répondre, utilisez la fonction **Répondre** sur :\n"
-                "• le message original du membre ;\n"
-                "• ou ce message de notification.\n\n"
-                "René enverra automatiquement la réponse en MP."
-            ),
-            COLOR_INFO,
+        title="Question reçue",
+        description=(
+            f"👤 **Auteur :** {message.author.mention}\n"
+            f"📍 **Question originale :** [ouvrir le message]({message.jump_url})\n\n"
+            f"**Question :**\n{message.content[:1800]}\n\n"
+            "Répondez avec la fonction **Répondre** sur le message original "
+            "ou sur cette notification. René enverra la réponse en MP."
         ),
+        color=COLOR_INFO,
+        image_path=IMAGE_READ,
         allowed_mentions=discord.AllowedMentions(
             roles=True,
             users=False,
@@ -1105,21 +1384,19 @@ async def register_question(message: discord.Message) -> None:
         ),
     )
 
-    confirmation_message = await message.reply(
-        embed=build_embed(
-            "Question transmise",
-            (
-                "René a remis ta question aux modérateurs.\n"
-                "Tu recevras leur réponse directement en message privé."
-            ),
-            COLOR_SUCCESS,
-        ),
-        mention_author=False,
-    )
-
     question_data["staff_notification_message_id"] = notification_message.id
-    question_data["confirmation_message_id"] = confirmation_message.id
-    save_json(QUESTIONS_FILE, bot.questions)
+    save_runtime_json(QUESTIONS_FILE, bot.questions)
+
+    await edit_embed_with_thumbnail(
+        confirmation_message,
+        title="Question transmise",
+        description=(
+            "C'est noté ! René a remis ta question aux modérateurs.\n"
+            "Tu recevras leur réponse directement en message privé."
+        ),
+        color=COLOR_SUCCESS,
+        image_path=IMAGE_NOTED,
+    )
 
 
 def find_question_from_reference(
@@ -1127,20 +1404,16 @@ def find_question_from_reference(
     referenced_message_id: int,
 ) -> tuple[str | None, dict[str, Any] | None]:
     guild_questions = bot.questions.get(str(guild_id), {})
-
-    # Réponse directe au message original.
     direct = guild_questions.get(str(referenced_message_id))
     if direct:
         return str(referenced_message_id), direct
 
-    # Réponse au message de notification du staff ou au message de confirmation.
     for question_id, question in guild_questions.items():
         related_ids = {
             int(question.get("question_message_id", 0) or 0),
             int(question.get("staff_notification_message_id", 0) or 0),
             int(question.get("confirmation_message_id", 0) or 0),
         }
-
         if referenced_message_id in related_ids:
             return question_id, question
 
@@ -1161,94 +1434,97 @@ async def process_moderator_answer(message: discord.Message) -> bool:
         message.guild.id,
         message.reference.message_id,
     )
-
     if question is None or question_id is None:
         return False
 
-    if question.get("answered"):
-        answered_by_id = question.get("answered_by")
-        answered_by = (
-            message.guild.get_member(int(answered_by_id))
-            if answered_by_id
-            else None
-        )
-        answered_name = (
-            answered_by.display_name
-            if answered_by
-            else "un autre modérateur"
-        )
+    lock_key = (message.guild.id, question_id)
+    lock = bot.question_locks.setdefault(lock_key, asyncio.Lock())
 
-        await message.reply(
-            (
-                f"Désolé {message.author.mention}, "
-                f"**{answered_name}** a déjà répondu à cette question."
-            ),
-            mention_author=False,
-        )
-        return True
+    async with lock:
+        question = bot.questions.get(str(message.guild.id), {}).get(question_id)
+        if question is None:
+            return False
 
-    answer_text = message.content.strip()
+        if question.get("answered"):
+            answered_by_id = question.get("answered_by")
+            answered_by = (
+                message.guild.get_member(int(answered_by_id))
+                if answered_by_id
+                else None
+            )
+            answered_name = (
+                answered_by.display_name
+                if answered_by
+                else "un autre modérateur"
+            )
+            await reply_embed_with_thumbnail(
+                message,
+                title="Question déjà traitée",
+                description=(
+                    f"Désolé {message.author.mention}, "
+                    f"**{answered_name}** a déjà répondu à cette question."
+                ),
+                color=COLOR_WARNING,
+                image_path=IMAGE_NOTED,
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+            return True
 
-    if not answer_text:
-        await message.reply(
-            "La réponse ne peut pas être vide.",
-            mention_author=False,
-        )
-        return True
+        answer_text = message.content.strip()
+        if not answer_text:
+            await reply_embed_with_thumbnail(
+                message,
+                title="Réponse vide",
+                description="La réponse ne peut pas être vide.",
+                color=COLOR_DANGER,
+                image_path=IMAGE_CRY,
+            )
+            return True
 
-    try:
-        user = bot.get_user(int(question["author_id"]))
+        try:
+            user = bot.get_user(int(question["author_id"]))
+            if user is None:
+                user = await bot.fetch_user(int(question["author_id"]))
 
-        if user is None:
-            user = await bot.fetch_user(int(question["author_id"]))
+            await send_embed_with_thumbnail(
+                user,
+                title="Réponse à ta question",
+                description=(
+                    f"**Ta question :**\n{question.get('content', '')}\n\n"
+                    f"**Réponse de {message.author.display_name} :**\n"
+                    f"{answer_text[:1800]}"
+                ),
+                color=COLOR_SUCCESS,
+                image_path=IMAGE_READ,
+            )
+            delivery = "La réponse a bien été envoyée en MP."
+        except discord.Forbidden:
+            delivery = (
+                "Impossible d'envoyer le MP : les messages privés du membre "
+                "sont probablement fermés."
+            )
+        except discord.NotFound:
+            delivery = "Le compte du membre n'a pas pu être retrouvé."
+        except discord.HTTPException as error:
+            logger.exception("Erreur pendant l'envoi de la réponse en MP.")
+            delivery = f"Erreur Discord pendant l'envoi du MP : `{error}`"
 
-        await send_embed_with_thumbnail(
-            user,
-            title="Réponse à ta question",
-            description=(
-                f"**Ta question :**\n{question.get('content', '')}\n\n"
-                f"**Réponse de {message.author.display_name} :**\n"
-                f"{answer_text}"
-            ),
+        question["answered"] = True
+        question["answered_by"] = message.author.id
+        question["answer"] = answer_text[:1800]
+        question["answered_at"] = datetime.now(timezone.utc).isoformat()
+        question["delivery_result"] = delivery
+        bot.questions[str(message.guild.id)][question_id] = question
+        save_runtime_json(QUESTIONS_FILE, bot.questions)
+
+        await reply_embed_with_thumbnail(
+            message,
+            title="Réponse enregistrée",
+            description=f"✅ {delivery}",
             color=COLOR_SUCCESS,
-            image_path=IMAGE_READ,
+            image_path=IMAGE_NOTED,
         )
-
-        delivery = "La réponse a bien été envoyée en MP."
-
-    except discord.Forbidden:
-        delivery = (
-            "Je ne peux pas envoyer de MP à cette personne : "
-            "ses messages privés sont probablement fermés."
-        )
-
-    except discord.NotFound:
-        delivery = "Le compte de la personne n'a pas pu être retrouvé."
-
-    except discord.HTTPException as error:
-        logger.exception("Erreur pendant l'envoi de la réponse en MP.")
-        delivery = f"Erreur Discord pendant l'envoi du MP : `{error}`"
-
-    # La question est verrouillée dès qu'un modérateur a traité la réponse,
-    # afin d'empêcher deux réponses simultanées.
-    question["answered"] = True
-    question["answered_by"] = message.author.id
-    question["answer"] = answer_text[:1800]
-    question["answered_at"] = datetime.now(timezone.utc).isoformat()
-    question["delivery_result"] = delivery
-    bot.questions[str(message.guild.id)][question_id] = question
-    save_json(QUESTIONS_FILE, bot.questions)
-
-    await message.reply(
-        embed=build_embed(
-            "Réponse enregistrée",
-            f"✅ {delivery}",
-            COLOR_SUCCESS,
-        ),
-        mention_author=False,
-    )
-
-    return True
+        return True
 
 
 # ============================================================
@@ -1258,7 +1534,6 @@ async def process_moderator_answer(message: discord.Message) -> bool:
 def get_configured_moderators(guild: discord.Guild) -> list[discord.Member]:
     config = bot.get_guild_config(guild.id)
     role_id = config.get("moderator_role_id")
-
     moderators: list[discord.Member] = []
     seen: set[int] = set()
 
@@ -1287,24 +1562,12 @@ def get_configured_moderators(guild: discord.Guild) -> list[discord.Member]:
 
 
 def waiting_members(channel: discord.VoiceChannel) -> list[discord.Member]:
-    """
-    Toutes les personnes humaines dans le vocal d'attente.
-
-    Les modérateurs sont inclus afin de permettre les tests avec un compte
-    staff et d'éviter les boucles de connexion/déconnexion.
-    """
-    return [
-        member
-        for member in channel.members
-        if not member.bot
-    ]
+    return [member for member in channel.members if not member.bot]
 
 
 def get_ffmpeg_executable() -> str:
     custom = os.getenv("FFMPEG_EXECUTABLE")
-    if custom:
-        return custom
-    return imageio_ffmpeg.get_ffmpeg_exe()
+    return custom or imageio_ffmpeg.get_ffmpeg_exe()
 
 
 async def notify_moderators_waiting(
@@ -1316,11 +1579,16 @@ async def notify_moderators_waiting(
     moderators = get_configured_moderators(guild)
     sent = 0
     failed = 0
-
     waiting_list = "\n".join(
         f"• **{member.display_name}** (`{member.id}`)"
         for member in members
     )
+
+    if not moderators:
+        logger.warning(
+            "VOCAL : aucun modérateur n'est disponible sur le serveur %s.",
+            guild.id,
+        )
 
     for moderator in moderators:
         try:
@@ -1342,8 +1610,7 @@ async def notify_moderators_waiting(
             failed += 1
 
     logger.info(
-        "Alerte vocal attente serveur=%s cycle=%s envoyés=%s échecs=%s",
-        guild.id,
+        "VOCAL : alerte cycle=%s envoyés=%s échecs=%s.",
         cycle_number,
         sent,
         failed,
@@ -1351,24 +1618,120 @@ async def notify_moderators_waiting(
     return sent, failed
 
 
-async def disconnect_waiting_voice(guild: discord.Guild) -> None:
+async def cleanup_voice_client(guild: discord.Guild) -> None:
     voice_client = guild.voice_client
-
     if voice_client is None:
         return
 
+    logger.info("VOCAL : nettoyage de l'ancienne connexion vocale.")
     try:
         if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
+    except Exception:
+        pass
 
-        if voice_client.is_connected():
-            await voice_client.disconnect(force=True)
+    try:
+        await voice_client.disconnect(force=True)
+    except Exception:
+        pass
 
-    except (discord.ClientException, discord.HTTPException):
-        logger.exception(
-            "Erreur pendant la déconnexion vocale du serveur %s.",
-            guild.id,
+    try:
+        voice_client.cleanup()
+    except Exception:
+        pass
+
+    await asyncio.sleep(1.0)
+
+
+async def disconnect_waiting_voice(guild: discord.Guild) -> None:
+    await cleanup_voice_client(guild)
+
+
+async def connect_voice_safely(
+    guild: discord.Guild,
+    channel: discord.VoiceChannel,
+) -> discord.VoiceClient | None:
+    lock = bot.voice_connect_locks.setdefault(guild.id, asyncio.Lock())
+
+    async with lock:
+        me = guild.me
+        if me is None:
+            logger.error("VOCAL : membre du bot introuvable dans le serveur.")
+            return None
+
+        permissions = channel.permissions_for(me)
+        if not permissions.view_channel or not permissions.connect or not permissions.speak:
+            logger.error(
+                "VOCAL : permissions insuffisantes dans %s "
+                "(voir=%s connecter=%s parler=%s).",
+                channel.name,
+                permissions.view_channel,
+                permissions.connect,
+                permissions.speak,
+            )
+            return None
+
+        existing = guild.voice_client
+        if existing is not None and existing.is_connected():
+            if existing.channel and existing.channel.id != channel.id:
+                try:
+                    await existing.move_to(channel)
+                except (discord.ClientException, discord.HTTPException):
+                    await cleanup_voice_client(guild)
+                else:
+                    return existing
+            else:
+                return existing
+
+        if existing is not None:
+            await cleanup_voice_client(guild)
+
+        for attempt in range(1, VOICE_CONNECT_ATTEMPTS + 1):
+            if not waiting_members(channel) or bot.stopping:
+                return None
+
+            logger.info(
+                "VOCAL : tentative de connexion %s/%s à %s.",
+                attempt,
+                VOICE_CONNECT_ATTEMPTS,
+                channel.name,
+            )
+
+            try:
+                voice_client = await channel.connect(
+                    timeout=VOICE_CONNECT_TIMEOUT_SECONDS,
+                    reconnect=False,
+                    self_deaf=True,
+                    self_mute=False,
+                )
+                await asyncio.sleep(0.5)
+                if voice_client.is_connected():
+                    logger.info("VOCAL : connexion vocale établie.")
+                    return voice_client
+                await cleanup_voice_client(guild)
+            except (
+                asyncio.TimeoutError,
+                discord.ClientException,
+                discord.ConnectionClosed,
+                discord.HTTPException,
+            ) as error:
+                logger.warning(
+                    "VOCAL : échec de connexion %s/%s : %s",
+                    attempt,
+                    VOICE_CONNECT_ATTEMPTS,
+                    error,
+                )
+                await cleanup_voice_client(guild)
+
+            if attempt < VOICE_CONNECT_ATTEMPTS:
+                await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS * attempt)
+
+        logger.error(
+            "VOCAL : impossible de rejoindre %s après %s tentatives.",
+            channel.name,
+            VOICE_CONNECT_ATTEMPTS,
         )
+        return None
 
 
 async def waiting_voice_loop(guild: discord.Guild) -> None:
@@ -1379,93 +1742,63 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
         while not bot.stopping:
             config = bot.get_guild_config(guild.id)
             channel_id = config.get("waiting_voice_channel_id")
-
             if not channel_id:
                 break
 
             channel = guild.get_channel(int(channel_id))
             if not isinstance(channel, discord.VoiceChannel):
+                logger.error("VOCAL : le salon configuré est introuvable.")
                 break
 
-            await asyncio.sleep(0.75)
-
+            await asyncio.sleep(0.5)
             members = waiting_members(channel)
             if not members:
                 break
 
             if not AUDIO_WAITING.is_file():
-                logger.error(
-                    "Le fichier ATTENTE.mp3 est introuvable dans %s.",
-                    BASE_DIR,
-                )
-
+                logger.error("VOCAL : ATTENTE.mp3 est introuvable.")
                 for moderator in get_configured_moderators(guild):
                     try:
-                        await moderator.send(
-                            "❌ René ne trouve pas `ATTENTE.mp3`. "
-                            "Ajoute-le dans le même dossier que le script."
+                        await send_embed_with_thumbnail(
+                            moderator,
+                            title="Son d'attente introuvable",
+                            description=(
+                                "René ne trouve pas `ATTENTE.mp3` dans son dossier."
+                            ),
+                            color=COLOR_DANGER,
+                            image_path=IMAGE_CRY,
                         )
                     except (discord.Forbidden, discord.HTTPException):
                         pass
                 break
 
-            voice_client = guild.voice_client
-
-            try:
-                if voice_client is None or not voice_client.is_connected():
-                    logger.info(
-                        "VOCAL : connexion de René au salon %s (%s).",
-                        channel.name,
-                        channel.id,
-                    )
-                    voice_client = await channel.connect(
-                        timeout=VOICE_CONNECT_TIMEOUT_SECONDS,
-                        reconnect=True,
-                        self_deaf=True,
-                    )
-                elif voice_client.channel is None:
-                    await disconnect_waiting_voice(guild)
+            voice_client = await connect_voice_safely(guild, channel)
+            if voice_client is None:
+                if waiting_members(channel):
                     await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
                     continue
-                elif voice_client.channel.id != channel.id:
-                    await voice_client.move_to(channel)
+                break
 
-            except (
-                asyncio.TimeoutError,
-                discord.ClientException,
-                discord.HTTPException,
-            ):
-                logger.exception(
-                    "Impossible de rejoindre le vocal d'attente du serveur %s.",
-                    guild.id,
-                )
-                await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
-                continue
-
-            while (
-                voice_client.is_connected()
-                and (voice_client.is_playing() or voice_client.is_paused())
-            ):
-                if not waiting_members(channel):
-                    voice_client.stop()
-                    break
+            if voice_client.is_playing() or voice_client.is_paused():
+                voice_client.stop()
                 await asyncio.sleep(0.3)
 
-            if not waiting_members(channel):
+            members = waiting_members(channel)
+            if not members:
                 break
 
             cycle_number += 1
-
             logger.info(
                 "VOCAL : lancement du cycle audio n°%s dans %s.",
                 cycle_number,
                 channel.name,
             )
 
+            # Le MP est renvoyé à chaque nouvelle lecture, comme demandé.
             await notify_moderators_waiting(
                 guild,
                 channel,
-                waiting_members(channel),
+                members,
                 cycle_number,
             )
 
@@ -1474,22 +1807,19 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
 
             def after_playback(error: Exception | None) -> None:
                 if error is not None:
-                    logger.error(
-                        "Erreur de lecture d'ATTENTE.mp3 : %s",
-                        error,
-                    )
+                    logger.error("VOCAL : erreur de lecture : %s", error)
                 event_loop.call_soon_threadsafe(playback_finished.set)
 
             try:
+                ffmpeg = get_ffmpeg_executable()
                 logger.info(
-                    "VOCAL : lecture de %s avec FFmpeg=%s.",
-                    AUDIO_WAITING,
-                    get_ffmpeg_executable(),
+                    "VOCAL : lecture de %s avec %s.",
+                    AUDIO_WAITING.name,
+                    ffmpeg,
                 )
-
                 source = discord.FFmpegOpusAudio(
                     str(AUDIO_WAITING),
-                    executable=get_ffmpeg_executable(),
+                    executable=ffmpeg,
                     before_options="-nostdin -hide_banner -loglevel error",
                     options="-vn",
                 )
@@ -1501,6 +1831,10 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
                             voice_client.stop()
                         break
 
+                    if not voice_client.is_connected():
+                        logger.warning("VOCAL : connexion perdue pendant la lecture.")
+                        break
+
                     try:
                         await asyncio.wait_for(
                             playback_finished.wait(),
@@ -1509,93 +1843,68 @@ async def waiting_voice_loop(guild: discord.Guild) -> None:
                     except asyncio.TimeoutError:
                         pass
 
-            except (
-                discord.ClientException,
-                OSError,
-                RuntimeError,
-            ):
-                logger.exception("Impossible de lire ATTENTE.mp3.")
+            except (discord.ClientException, OSError, RuntimeError) as error:
+                logger.exception("VOCAL : impossible de lire ATTENTE.mp3 : %s", error)
+                await cleanup_voice_client(guild)
                 await asyncio.sleep(VOICE_RETRY_DELAY_SECONDS)
 
     except asyncio.CancelledError:
         raise
-
     finally:
         await disconnect_waiting_voice(guild)
-
         if bot.waiting_voice_tasks.get(guild.id) is current_task:
             bot.waiting_voice_tasks.pop(guild.id, None)
 
 
 async def ensure_waiting_voice_task(guild: discord.Guild) -> None:
-    """
-    Démarre ou arrête le vocal d'attente sans lancer plusieurs boucles.
-    """
     logger.info(
         "VOCAL : vérification de la tâche d'attente pour le serveur %s.",
         guild.id,
     )
-
     lock = bot.waiting_voice_locks.setdefault(guild.id, asyncio.Lock())
 
     async with lock:
         config = bot.get_guild_config(guild.id)
         channel_id = config.get("waiting_voice_channel_id")
+        existing = bot.waiting_voice_tasks.get(guild.id)
 
         if not channel_id:
-            logger.warning(
-                "VOCAL : aucune configuration de vocal d'attente, arrêt de la tâche."
-            )
-            existing = bot.waiting_voice_tasks.get(guild.id)
             if existing and not existing.done():
                 existing.cancel()
                 await asyncio.gather(existing, return_exceptions=True)
-
             bot.waiting_voice_tasks.pop(guild.id, None)
             await disconnect_waiting_voice(guild)
             return
 
         channel = guild.get_channel(int(channel_id))
         if not isinstance(channel, discord.VoiceChannel):
-            logger.error(
-                "VOCAL : le salon configuré %s n'existe pas ou n'est pas vocal.",
-                channel_id,
-            )
+            logger.error("VOCAL : le salon configuré n'est pas un vocal valide.")
             return
 
         await asyncio.sleep(1.0)
-
         members = waiting_members(channel)
-        existing = bot.waiting_voice_tasks.get(guild.id)
 
         if not members:
-            logger.info(
-                "VOCAL : aucun humain présent, René quitte ou reste déconnecté."
-            )
+            logger.info("VOCAL : aucun humain présent.")
             if existing and not existing.done():
                 existing.cancel()
                 await asyncio.gather(existing, return_exceptions=True)
-
             bot.waiting_voice_tasks.pop(guild.id, None)
             await disconnect_waiting_voice(guild)
             return
 
         if existing is not None and not existing.done():
-            logger.info(
-                "VOCAL : une tâche d'attente existe déjà, aucune nouvelle tâche créée."
-            )
+            logger.info("VOCAL : la boucle d'attente est déjà active.")
             return
 
         logger.info(
-            "VOCAL : création de la boucle d'attente pour %s humain(s).",
+            "VOCAL : création de la boucle pour %s humain(s).",
             len(members),
         )
-
-        task = asyncio.create_task(
+        bot.waiting_voice_tasks[guild.id] = asyncio.create_task(
             waiting_voice_loop(guild),
             name=f"waiting-voice-{guild.id}",
         )
-        bot.waiting_voice_tasks[guild.id] = task
 
 
 @bot.event
@@ -1604,81 +1913,30 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after: discord.VoiceState,
 ) -> None:
+    if member.bot or bot.stopping:
+        return
+
     before_id = before.channel.id if before.channel else None
     after_id = after.channel.id if after.channel else None
-
-    logger.info(
-        "VOCAL : membre=%s (%s) avant=%s après=%s",
-        member,
-        member.id,
-        before_id,
-        after_id,
-    )
-
-    if member.bot:
-        logger.info("VOCAL : événement ignoré car le membre est un bot.")
-        return
-
-    if bot.stopping:
-        logger.info("VOCAL : événement ignoré car René est en arrêt.")
-        return
-
     config = bot.get_guild_config(member.guild.id)
     channel_id = config.get("waiting_voice_channel_id")
 
     logger.info(
-        "VOCAL : serveur=%s salon_attente_configuré=%s",
-        member.guild.id,
+        "VOCAL : membre=%s avant=%s après=%s configuré=%s",
+        member,
+        before_id,
+        after_id,
         channel_id,
     )
 
     if not channel_id:
-        logger.warning(
-            "VOCAL : aucun salon d'attente configuré pour le serveur %s.",
-            member.guild.id,
-        )
         return
 
-    try:
-        watched_id = int(channel_id)
-    except (TypeError, ValueError):
-        logger.error(
-            "VOCAL : identifiant de salon invalide dans la configuration : %r",
-            channel_id,
-        )
+    watched_id = int(channel_id)
+    if before_id != watched_id and after_id != watched_id:
         return
 
-    concerned = before_id == watched_id or after_id == watched_id
-
-    logger.info(
-        "VOCAL : salon surveillé=%s événement_concerné=%s",
-        watched_id,
-        concerned,
-    )
-
-    if not concerned:
-        return
-
-    # Discord met parfois un court instant à actualiser channel.members.
-    await asyncio.sleep(1.25)
-
-    channel = member.guild.get_channel(watched_id)
-
-    if not isinstance(channel, discord.VoiceChannel):
-        logger.error(
-            "VOCAL : le salon configuré %s est introuvable ou n'est pas vocal.",
-            watched_id,
-        )
-        return
-
-    humans = waiting_members(channel)
-
-    logger.info(
-        "VOCAL : humains présents dans %s = %s",
-        channel.name,
-        [f"{human.display_name} ({human.id})" for human in humans],
-    )
-
+    await asyncio.sleep(1.0)
     await ensure_waiting_voice_task(member.guild)
 
 
@@ -1705,12 +1963,19 @@ async def on_ready() -> None:
 
     logger.info("Connecté en tant que %s (%s).", bot.user, bot.user.id)
 
-    if not bot.remote_config_loaded:
-        bot.remote_config_loaded = True
-        loaded = await load_config_from_discord()
+    if not bot.remote_state_loaded:
+        bot.remote_state_loaded = True
+        loaded = await load_state_from_discord()
+        if not loaded or bot.remote_state_message_id is None:
+            await persist_state_to_discord()
 
-        if not loaded:
-            await persist_config_to_discord()
+    # Les boucles démarrent seulement après le chargement de l'état persistant.
+    if not temporary_ban_checker.is_running():
+        temporary_ban_checker.start()
+    if not funny_presence_loop.is_running():
+        funny_presence_loop.start()
+    if not seniority_refresh_loop.is_running():
+        seniority_refresh_loop.start()
 
     await bot.change_presence(
         status=discord.Status.online,
@@ -1803,7 +2068,7 @@ async def on_member_remove(member: discord.Member) -> None:
 
     # Garde au maximum les 500 derniers départs enregistrés.
     bot.departed_members[guild_key] = records[-500:]
-    save_json(DEPARTED_MEMBERS_FILE, bot.departed_members)
+    save_runtime_json(DEPARTED_MEMBERS_FILE, bot.departed_members)
     await update_seniority_board(member.guild)
 
 
@@ -1819,7 +2084,7 @@ def get_warning_count(guild_id: int, user_id: int) -> int:
 def set_warning_count(guild_id: int, user_id: int, count: int) -> None:
     guild_warnings = bot.warning_data.setdefault(str(guild_id), {})
     guild_warnings[str(user_id)] = count
-    save_json(WARNINGS_FILE, bot.warning_data)
+    save_runtime_json(WARNINGS_FILE, bot.warning_data)
 
 
 def create_case(
@@ -1836,8 +2101,13 @@ def create_case(
     guild_key = str(guild_id)
     cases = bot.moderation_cases.setdefault(guild_key, [])
 
+    next_case_id = max(
+        (int(existing.get("id", 0)) for existing in cases),
+        default=0,
+    ) + 1
+
     case = {
-        "id": len(cases) + 1,
+        "id": next_case_id,
         "user_id": user_id,
         "moderator_id": moderator_id,
         "type": case_type,
@@ -1849,7 +2119,9 @@ def create_case(
     }
 
     cases.append(case)
-    save_json(CASES_FILE, bot.moderation_cases)
+    # Les 2 000 dossiers les plus récents par serveur sont conservés.
+    bot.moderation_cases[guild_key] = cases[-2000:]
+    save_runtime_json(CASES_FILE, bot.moderation_cases)
     return case
 
 
@@ -1870,6 +2142,9 @@ async def send_case_to_staff(
 
     user = guild.get_member(int(case["user_id"]))
     user_text = user.mention if user else f"<@{case['user_id']}>"
+    safe_deleted_content = str(
+        case.get("deleted_content") or "Aucun contenu texte"
+    ).replace("```", "[code]")
 
     embed = build_embed(
         f"Dossier #{case['id']} — {case['type']}",
@@ -1879,7 +2154,7 @@ async def send_case_to_staff(
             f"⚠️ **Avertissements :** {case['warning_count']}/{MAX_WARNINGS}\n"
             f"📝 **Motif :** {case['reason']}\n\n"
             f"**Message supprimé :**\n"
-            f"```{case['deleted_content'] or 'Aucun contenu texte'}```"
+            f"```{safe_deleted_content}```"
         ),
         COLOR_WARNING,
     )
@@ -1960,7 +2235,7 @@ def register_temporary_ban(
 ) -> None:
     guild_bans = bot.temporary_bans.setdefault(str(guild_id), {})
     guild_bans[str(user_id)] = unban_at.isoformat()
-    save_json(TEMP_BANS_FILE, bot.temporary_bans)
+    save_runtime_json(TEMP_BANS_FILE, bot.temporary_bans)
 
 
 def remove_temporary_ban(guild_id: int, user_id: int) -> None:
@@ -1971,7 +2246,7 @@ def remove_temporary_ban(guild_id: int, user_id: int) -> None:
     if not guild_bans:
         bot.temporary_bans.pop(guild_key, None)
 
-    save_json(TEMP_BANS_FILE, bot.temporary_bans)
+    save_runtime_json(TEMP_BANS_FILE, bot.temporary_bans)
 
 
 @tasks.loop(minutes=1)
@@ -2038,6 +2313,21 @@ async def punish_member(
         discord_result = "René n'a pas la permission de bannir ce membre."
     except discord.HTTPException as error:
         discord_result = f"Erreur Discord : `{error}`"
+
+    ban_case = create_case(
+        member.guild.id,
+        member.id,
+        bot.user.id if bot.user else None,
+        case_type="Bannissement temporaire",
+        reason="10 avertissements atteints",
+        warning_count=MAX_WARNINGS,
+        channel_id=channel.id,
+        deleted_content=(
+            f"Discord : {discord_result} | "
+            f"Roblox simulé : {linked_name}, {FAKE_ROBLOX_BAN_DAYS} jours"
+        ),
+    )
+    await send_case_to_staff(member.guild, ban_case)
 
     await send_embed_with_thumbnail(
         channel,
@@ -2179,10 +2469,7 @@ async def inspect_links(message: discord.Message) -> str:
 
     # Le staff peut publier des liens sans contrôle.
     if isinstance(message.author, discord.Member):
-        if (
-            message.author.guild_permissions.manage_messages
-            or message.author.guild_permissions.administrator
-        ):
+        if member_has_moderator_role(message.author):
             return "allowed"
 
     inspection_message = await send_embed_with_thumbnail(
@@ -2389,7 +2676,7 @@ async def config_command(
     if vocal_attente is not None:
         config["waiting_voice_channel_id"] = vocal_attente.id
 
-    await save_config_persistently()
+    await save_state_immediately()
 
     if salon_anciennete is not None:
         await update_seniority_board(interaction.guild)
@@ -2437,7 +2724,7 @@ async def mod_define_command(
     await begin_interaction_thinking(interaction)
     config = bot.get_guild_config(interaction.guild.id)
     config["moderator_role_id"] = role.id
-    await save_config_persistently()
+    await save_state_immediately()
 
     await finish_interaction(
         interaction,
@@ -2462,7 +2749,7 @@ async def questions_channel_command(
     await begin_interaction_thinking(interaction)
     config = bot.get_guild_config(interaction.guild.id)
     config["questions_channel_id"] = salon.id
-    await save_config_persistently()
+    await save_state_immediately()
 
     await finish_interaction(
         interaction,
@@ -2490,7 +2777,7 @@ async def waiting_voice_command(
     await begin_interaction_thinking(interaction)
     config = bot.get_guild_config(interaction.guild.id)
     config["waiting_voice_channel_id"] = salon.id
-    await save_config_persistently()
+    await save_state_immediately()
     await ensure_waiting_voice_task(interaction.guild)
 
     await finish_interaction(
@@ -2502,6 +2789,84 @@ async def waiting_voice_command(
             "`ATTENTE.mp3` en boucle et prévient les modérateurs en MP "
             "à chaque redémarrage du son."
         ),
+    )
+
+
+@bot.tree.command(
+    name="diagnosticvocal",
+    description="Vérifier toute la configuration du vocal d'attente.",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def diagnostic_voice_command(interaction: discord.Interaction) -> None:
+    assert interaction.guild is not None
+
+    await begin_interaction_thinking(interaction)
+    config = bot.get_guild_config(interaction.guild.id)
+    channel_id = config.get("waiting_voice_channel_id")
+    channel = (
+        interaction.guild.get_channel(int(channel_id))
+        if channel_id
+        else None
+    )
+
+    try:
+        discord_version = importlib_metadata.version("discord.py")
+    except importlib_metadata.PackageNotFoundError:
+        discord_version = "introuvable"
+    try:
+        davey_version = importlib_metadata.version("davey")
+    except importlib_metadata.PackageNotFoundError:
+        davey_version = "NON INSTALLÉ"
+
+    audio_ok = AUDIO_WAITING.is_file()
+    ffmpeg_ok = False
+    ffmpeg_text = "introuvable"
+    try:
+        ffmpeg_text = get_ffmpeg_executable()
+        ffmpeg_ok = Path(ffmpeg_text).is_file()
+    except Exception as error:
+        ffmpeg_text = str(error)
+
+    if isinstance(channel, discord.VoiceChannel) and interaction.guild.me:
+        perms = channel.permissions_for(interaction.guild.me)
+        permission_text = (
+            f"Voir : {'✅' if perms.view_channel else '❌'} • "
+            f"Connexion : {'✅' if perms.connect else '❌'} • "
+            f"Parler : {'✅' if perms.speak else '❌'}"
+        )
+        humans = waiting_members(channel)
+        channel_text = f"{channel.mention} (`{channel.id}`)"
+    else:
+        permission_text = "Salon non configuré ou introuvable."
+        humans = []
+        channel_text = "non configuré"
+
+    voice_client = interaction.guild.voice_client
+    voice_text = (
+        f"connecté dans {voice_client.channel.mention}"
+        if voice_client and voice_client.is_connected() and voice_client.channel
+        else "déconnecté"
+    )
+    task = bot.waiting_voice_tasks.get(interaction.guild.id)
+    task_text = "active" if task and not task.done() else "inactive"
+
+    await finish_interaction(
+        interaction,
+        title="Diagnostic vocal terminé",
+        description=(
+            f"🎙️ **Salon :** {channel_text}\n"
+            f"🔐 **Permissions :** {permission_text}\n"
+            f"👥 **Humains présents :** {len(humans)}\n"
+            f"🎵 **ATTENTE.mp3 :** {'✅' if audio_ok else '❌'}\n"
+            f"🧰 **FFmpeg :** {'✅' if ffmpeg_ok else '⚠️'} `{ffmpeg_text}`\n"
+            f"📦 **discord.py :** `{discord_version}`\n"
+            f"🔒 **DAVE/davey :** `{davey_version}`\n"
+            f"🔊 **VoiceClient :** {voice_text}\n"
+            f"🔁 **Boucle :** {task_text}"
+        ),
+        color=COLOR_SUCCESS if audio_ok and davey_version != "NON INSTALLÉ" else COLOR_WARNING,
+        image_path=IMAGE_INSPECT,
     )
 
 
@@ -2622,7 +2987,7 @@ async def link_roblox_command(
 
     links = bot.roblox_links.setdefault(str(interaction.guild.id), {})
     links[str(interaction.user.id)] = pseudo
-    save_json(ROBLOX_LINKS_FILE, bot.roblox_links)
+    save_runtime_json(ROBLOX_LINKS_FILE, bot.roblox_links)
 
     await finish_interaction(
         interaction,
@@ -2631,6 +2996,71 @@ async def link_roblox_command(
             f"Ton compte est lié au pseudo Roblox **{pseudo}**.\n"
             "Ce lien sert seulement aux sanctions Roblox simulées."
         ),
+    )
+
+
+# ============================================================
+# /WARN MANUEL
+# ============================================================
+
+@bot.tree.command(
+    name="warn",
+    description="Donner manuellement un avertissement à un membre.",
+)
+@app_commands.describe(
+    membre="Membre à avertir",
+    raison="Motif de l'avertissement",
+)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.guild_only()
+async def manual_warn_command(
+    interaction: discord.Interaction,
+    membre: discord.Member,
+    raison: str,
+) -> None:
+    assert interaction.guild is not None
+
+    await begin_interaction_thinking(interaction)
+    if membre.bot:
+        await finish_interaction(
+            interaction,
+            title="Action impossible",
+            description="René ne peut pas avertir un bot.",
+            color=COLOR_DANGER,
+            image_path=IMAGE_CRY,
+        )
+        return
+
+    channel = interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await finish_interaction(
+            interaction,
+            title="Salon incompatible",
+            description="Utilise cette commande dans un salon textuel.",
+            color=COLOR_DANGER,
+            image_path=IMAGE_CRY,
+        )
+        return
+
+    count = await add_warning(
+        membre,
+        channel,
+        reason=f"Avertissement manuel par {interaction.user}: {raison[:500]}",
+        deleted_content="Aucun message supprimé — sanction manuelle.",
+        public_image=IMAGE_CRY,
+    )
+    if count >= MAX_WARNINGS:
+        await punish_member(membre, channel)
+
+    await finish_interaction(
+        interaction,
+        title="C'est noté !",
+        description=(
+            f"{membre.mention} possède maintenant **{count}/{MAX_WARNINGS} "
+            f"avertissements**.\nMotif : {raison[:500]}"
+        ),
+        color=COLOR_WARNING,
+        image_path=IMAGE_NOTED,
     )
 
 
@@ -2724,6 +3154,7 @@ async def stop_command(interaction: discord.Interaction) -> None:
         pass
 
     await set_bot_avatar(IMAGE_SLEEP)
+    await persist_state_to_discord()
     await asyncio.sleep(2)
     await bot.close()
 
@@ -2737,7 +3168,7 @@ async def slash_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ) -> None:
-    logger.error("Erreur de commande : %s", error)
+    logger.error("Erreur de commande slash : %s", error)
 
     if isinstance(error, app_commands.MissingPermissions):
         title = "Permission refusée"
@@ -2787,4 +3218,17 @@ if __name__ == "__main__":
     web_thread.start()
 
     logger.info("Connexion de René à Discord...")
-    bot.run(DISCORD_TOKEN.strip(), log_handler=None)
+    try:
+        bot.run(DISCORD_TOKEN.strip(), log_handler=None)
+    except Exception:
+        logger.exception("René s'est arrêté à cause d'une erreur fatale.")
+        raise
+
+    # Sur Render, quitter le processus relancerait automatiquement le bot.
+    # Après /stop, le serveur web reste donc actif mais René demeure hors ligne.
+    if bot.stopping:
+        logger.info(
+            "René dort volontairement. Redémarre le service Render pour le réveiller."
+        )
+        while True:
+            time.sleep(3600)
