@@ -1,0 +1,31 @@
+# Copie ce fichier dans rene/commands/ puis renomme-le, par exemple ping.py
+# IMPORTANT : l'extension doit être .py une fois terminée.
+
+from __future__ import annotations
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from rene.core import build_embed, COLOR_PRIMARY
+
+
+@app_commands.command(
+    name="macommande",
+    description="Description de ma nouvelle commande.",
+)
+async def ma_commande(interaction: discord.Interaction) -> None:
+    embed = build_embed(
+        "Ma commande",
+        "Elle a été ajoutée sans modifier main.py !",
+        COLOR_PRIMARY,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+async def setup(client: commands.Bot) -> None:
+    client.tree.add_command(ma_commande)
+
+
+async def teardown(client: commands.Bot) -> None:
+    client.tree.remove_command(ma_commande.name)
